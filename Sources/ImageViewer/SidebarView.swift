@@ -34,6 +34,12 @@ struct SidebarView: View {
                 }
                 .help("폴더 추가 (⇧⌘O)")
 
+                Button { library.removeRoots(library.selectedRoots) } label: {
+                    Image(systemName: "minus")
+                }
+                .help("고른 폴더를 목록에서 빼요 (폴더와 파일은 지워지지 않아요)")
+                .disabled(library.selectedRoots.isEmpty)
+
                 Spacer()
 
                 if !library.selectedFolders.isEmpty {
@@ -53,7 +59,7 @@ struct SidebarView: View {
         Button("Finder에서 보기") { library.revealInFinder(node.url) }
         if node.isRoot {
             Divider()
-            Button("목록에서 빼기") { library.removeRoot(node.url) }
+            Button("목록에서 빼기 (파일은 그대로)") { library.removeRoot(node.url) }
         }
     }
 }

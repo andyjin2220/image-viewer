@@ -81,6 +81,13 @@ final class MediaLibrary: ObservableObject {
 
     private var scanTask: Task<Void, Never>?
 
+    private static let savedFoldersKey = "savedFolders"
+
+    init() {
+        let saved = Self.restoreSavedFolders()
+        if !saved.isEmpty { load(folders: saved) }
+    }
+
     var current: MediaItem? {
         items.indices.contains(currentIndex) ? items[currentIndex] : nil
     }
@@ -104,7 +111,41 @@ final class MediaLibrary: ObservableObject {
     }
 
     func removeRoot(_ url: URL) {
-        load(folders: rootFolders.filter { $0 != url })
+        removeRoots([url])
+    }
+
+    func removeRoots(_ urls: Set<URL>) {
+        let paths = Set(urls.map { $0.standardizedFileURL.path })
+        load(folders: rootFolders.filter { !paths.contains($0.standardizedFileURL.path) })
+    }
+
+    func closeAllFolders() {
+        load(folders: [])
+    }
+
+    /// Opened folders that are selected in the sidebar (only top-level ones can be removed).
+    var selectedRoots: Set<URL> {
+        let roots = Set(rootFolders.map { $0.standardizedFileURL.path })
+        return Set(selectedFolders.filter { roots.contains($0.standardizedFileURL.path) })
+    }
+
+    // MARK: Remembering opened folders
+
+    /// Saves the opened folders as bookmarks, so they still open after being renamed or moved.
+    private func saveFolders(_ folders: [URL]) {
+        let bookmarks = folders.compactMap { try? $0.bookmarkData() }
+        UserDefaults.standard.set(bookmarks, forKey: Self.savedFoldersKey)
+    }
+
+    private static func restoreSavedFolders() -> [URL] {
+        guard let bookmarks = UserDefaults.standard.array(forKey: savedFoldersKey) as? [Data] else { return [] }
+        return bookmarks.compactMap { data in
+            var stale = false
+            guard let url = try? URL(resolvingBookmarkData: data, bookmarkDataIsStale: &stale) else { return nil }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return nil }
+            return url
+        }
     }
 
     private func pickFolders(prompt: String) -> [URL]? {
@@ -122,6 +163,13 @@ final class MediaLibrary: ObservableObject {
         scanTask?.cancel()
         let previousSelection = selectedFolders
         rootFolders = folders
+        saveFolders(folders)
+        if folders.isEmpty {
+            allItems = []
+            folderTree = []
+            selectedFolders = []
+            applyFilter()
+        }
         isScanning = !folders.isEmpty
         scanTask = Task {
             let (found, tree) = await Task.detached(priority: .userInitiated) {
@@ -321,9 +369,8 @@ final class MediaLibrary: ObservableObject {
         let mods = event.modifierFlags.intersection([.command, .option, .control])
         guard mods.isEmpty else { return false }
 
-        // Let the sidebar's folder list use the arrow keys itself.
-        if NSApp.keyWindow?.firstResponder is NSTableView { return false }
-
+        // Arrow keys always move between files, even while the sidebar has focus;
+        // folders are picked with the mouse.
         let inGrid = viewMode == .grid
         switch event.keyCode {
         case 124: next()                                        // right arrow

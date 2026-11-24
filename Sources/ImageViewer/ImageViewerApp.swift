@@ -18,6 +18,9 @@ struct ImageViewerApp: App {
                     .keyboardShortcut("o")
                 Button("폴더 추가…") { library.addFolders() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
+                Divider()
+                Button("모든 폴더 닫기") { library.closeAllFolders() }
+                    .disabled(library.rootFolders.isEmpty)
             }
             CommandMenu("보기") {
                 Button("썸네일 / 한 장씩 보기 전환") { library.toggleViewMode() }
