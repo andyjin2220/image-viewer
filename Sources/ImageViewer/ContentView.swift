@@ -4,24 +4,16 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var library: MediaLibrary
     @State private var keyMonitor: Any?
+    @AppStorage("thumbnailSize") private var thumbSize: Double = 160
 
     var body: some View {
-        Group {
-            if library.isScanning {
-                ProgressView("폴더를 살펴보는 중…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let item = library.current {
-                VStack(spacing: 0) {
-                    ImageCanvas(item: item)
-                    StatusBar(item: item)
-                }
-            } else {
-                EmptyStateView()
-            }
+        NavigationSplitView {
+            SidebarView()
+        } detail: {
+            detail
+                .toolbar { toolbarContent }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .navigationTitle(library.current?.name ?? "이미지 뷰어")
-        .toolbar { toolbarContent }
+        .navigationTitle(title)
         .onDrop(of: [.fileURL], isTargeted: nil, perform: handleDrop)
         .onAppear {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -34,6 +26,35 @@ struct ContentView: View {
         }
     }
 
+    private var title: String {
+        if library.viewMode == .single, let item = library.current { return item.name }
+        if library.items.isEmpty { return "이미지 뷰어" }
+        return "파일 \(library.items.count)개"
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        Group {
+            if library.isScanning {
+                ProgressView("폴더를 살펴보는 중…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let item = library.current {
+                VStack(spacing: 0) {
+                    switch library.viewMode {
+                    case .grid:
+                        ThumbnailGrid(thumbSize: CGFloat(thumbSize))
+                    case .single:
+                        ImageCanvas(item: item)
+                    }
+                    StatusBar(item: item)
+                }
+            } else {
+                EmptyStateView()
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
@@ -41,7 +62,16 @@ struct ContentView: View {
                 Label("폴더 열기", systemImage: "folder")
             }
             .help("폴더 열기 (⌘O)")
+
+            Picker("보기 방식", selection: $library.viewMode) {
+                Label("썸네일", systemImage: "square.grid.2x2").tag(ViewMode.grid)
+                Label("한 장씩", systemImage: "photo").tag(ViewMode.single)
+            }
+            .pickerStyle(.segmented)
+            .help("썸네일 / 한 장씩 보기 (Return, Esc)")
+            .disabled(library.current == nil)
         }
+
         ToolbarItemGroup(placement: .primaryAction) {
             Button { library.previous() } label: {
                 Label("이전", systemImage: "chevron.left")
@@ -55,25 +85,32 @@ struct ContentView: View {
             .help("다음 파일 (→)")
             .disabled(library.items.isEmpty)
 
-            Divider()
+            if library.viewMode == .grid {
+                Slider(value: $thumbSize, in: 80...280) {
+                    Text("썸네일 크기")
+                } minimumValueLabel: {
+                    Image(systemName: "photo").imageScale(.small)
+                } maximumValueLabel: {
+                    Image(systemName: "photo").imageScale(.large)
+                }
+                .frame(width: 140)
+                .help("썸네일 크기")
+            } else {
+                Button { library.zoomOut() } label: {
+                    Label("축소", systemImage: "minus.magnifyingglass")
+                }
+                .help("축소 (-)")
 
-            Button { library.zoomOut() } label: {
-                Label("축소", systemImage: "minus.magnifyingglass")
-            }
-            .help("축소 (-)")
-            .disabled(library.current == nil)
+                Button { library.zoomToFit() } label: {
+                    Label("화면에 맞추기", systemImage: "arrow.down.right.and.arrow.up.left")
+                }
+                .help("화면에 맞추기 (0)")
 
-            Button { library.zoomToFit() } label: {
-                Label("화면에 맞추기", systemImage: "arrow.down.right.and.arrow.up.left")
+                Button { library.zoomIn() } label: {
+                    Label("확대", systemImage: "plus.magnifyingglass")
+                }
+                .help("확대 (+)")
             }
-            .help("화면에 맞추기 (0)")
-            .disabled(library.current == nil)
-
-            Button { library.zoomIn() } label: {
-                Label("확대", systemImage: "plus.magnifyingglass")
-            }
-            .help("확대 (+)")
-            .disabled(library.current == nil)
 
             Button { library.toggleFullScreen() } label: {
                 Label("전체화면", systemImage: "arrow.up.left.and.arrow.down.right")
@@ -157,9 +194,11 @@ private struct StatusBar: View {
                 .onTapGesture(count: 2) { library.revealInFinder() }
                 .help("두 번 누르면 Finder에서 보여줘요")
             Spacer()
-            Text(library.zoom == nil ? "맞춤 \(percent(library.fitScale))" : percent(library.effectiveZoom))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
+            if library.viewMode == .single {
+                Text(library.zoom == nil ? "맞춤 \(percent(library.fitScale))" : percent(library.effectiveZoom))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
         }
         .font(.callout)
         .padding(.horizontal, 12)

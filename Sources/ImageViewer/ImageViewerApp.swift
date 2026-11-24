@@ -16,12 +16,17 @@ struct ImageViewerApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("폴더 열기…") { library.chooseFolders() }
                     .keyboardShortcut("o")
+                Button("폴더 추가…") { library.addFolders() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
             }
             CommandMenu("보기") {
-                Button("다음 파일") { library.next() }
-                    .keyboardShortcut(.rightArrow, modifiers: [])
-                Button("이전 파일") { library.previous() }
-                    .keyboardShortcut(.leftArrow, modifiers: [])
+                Button("썸네일 / 한 장씩 보기 전환") { library.toggleViewMode() }
+                    .keyboardShortcut("g")
+                Divider()
+                // ← → and the other plain keys are handled in MediaLibrary.handleKey
+                // so the sidebar's folder list can still use them when it has focus.
+                Button("다음 파일 (→)") { library.next() }
+                Button("이전 파일 (←)") { library.previous() }
                 Divider()
                 Button("확대") { library.zoomIn() }
                     .keyboardShortcut("=")
