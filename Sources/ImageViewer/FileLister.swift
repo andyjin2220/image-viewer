@@ -9,10 +9,31 @@ struct MediaItem: Identifiable, Hashable, Sendable {
 
     var id: URL { url }
     var name: String { url.lastPathComponent }
+    var kind: MediaKind { MediaKind(url: url) }
     var folder: URL { FileLister.normalized(url.deletingLastPathComponent()) }
 
     /// Path shown to the user, relative to the opened folder (e.g. "작업/2024/a.png").
     var displayPath: String { FileLister.displayPath(of: url, under: root) }
+}
+
+enum MediaKind: Sendable {
+    case image
+    case video
+    /// Clip Studio Paint file; shown through the preview image saved inside it.
+    case clip
+
+    static let videoExtensions: Set<String> = ["mp4", "mov", "m4v"]
+
+    init(url: URL) {
+        let ext = url.pathExtension.lowercased()
+        if Self.videoExtensions.contains(ext) {
+            self = .video
+        } else if ext == "clip" {
+            self = .clip
+        } else {
+            self = .image
+        }
+    }
 }
 
 struct FolderEntry: Hashable, Sendable {
@@ -37,6 +58,7 @@ enum FileLister {
     /// Formats macOS can decode on its own (ImageIO), including PSD.
     static let supportedExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "psd", "bmp", "tif", "tiff", "heic", "heif", "webp",
+        "mp4", "mov", "m4v", "clip",
     ]
 
     static let resourceKeys: [URLResourceKey] = [

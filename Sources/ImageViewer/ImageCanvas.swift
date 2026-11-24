@@ -80,7 +80,15 @@ struct ImageCanvas: View {
             return DecodedImage(image: image, pixelSize: pixelSize(of: image))
         }
 
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+        let source: CGImageSource?
+        if MediaKind(url: url) == .clip {
+            source = ClipFile.previewPNG(of: url).flatMap { CGImageSourceCreateWithData($0 as CFData, nil) }
+            if source == nil { return nil }
+        } else {
+            source = CGImageSourceCreateWithURL(url as CFURL, nil)
+        }
+
+        guard let source,
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = props[kCGImagePropertyPixelWidth] as? Int,
               let height = props[kCGImagePropertyPixelHeight] as? Int else {
