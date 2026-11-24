@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Thumbnails of every shown file, grouped by folder.
-/// Click selects, double-click (or Return) opens the file in the single view.
+/// Folder tiles (in folder mode) and thumbnails of the shown files.
+/// Click selects, double-click (or Return) opens a file; double-clicking a folder goes into it.
 struct ThumbnailGrid: View {
     @EnvironmentObject private var library: MediaLibrary
     let thumbSize: CGFloat
@@ -19,29 +19,46 @@ struct ThumbnailGrid: View {
                         spacing: spacing,
                         pinnedViews: [.sectionHeaders]
                     ) {
+                        if library.browseMode == .folder, !library.subfolders.isEmpty {
+                            Section {
+                                ForEach(library.subfolders, id: \.self) { folder in
+                                    FolderTile(folder: folder, size: thumbSize)
+                                        .onTapGesture(count: 2) { library.enter(folder) }
+                                        .contextMenu {
+                                            Button("열기") { library.enter(folder) }
+                                            Button("Finder에서 보기") { library.revealInFinder(folder) }
+                                        }
+                                }
+                            } header: {
+                                SectionHeader(title: "폴더", count: library.subfolders.count)
+                            }
+                        }
+
                         ForEach(library.sections) { section in
                             Section {
                                 ForEach(section.range, id: \.self) { index in
                                     cell(at: index)
                                 }
                             } header: {
-                                SectionHeader(section: section)
+                                SectionHeader(title: section.title, count: section.range.count)
                             }
                         }
                     }
                     .padding(padding)
                 }
-                .onAppear {
-                    scrollToCurrent(proxy, animated: false)
-                }
-                .onChange(of: library.currentIndex) {
-                    scrollToCurrent(proxy, animated: true)
-                }
+                .id(gridIdentity)
+                .onAppear { scrollToCurrent(proxy, animated: false) }
+                .onChange(of: library.currentIndex) { scrollToCurrent(proxy, animated: true) }
             }
             .onChange(of: columnCount(for: geo.size.width), initial: true) { _, columns in
                 library.gridColumns = columns
             }
         }
+    }
+
+    /// A new place starts scrolled to the top.
+    private var gridIdentity: String {
+        "\(library.browseMode)-\(library.currentFolder?.path ?? "")"
     }
 
     @ViewBuilder
@@ -68,21 +85,21 @@ struct ThumbnailGrid: View {
         if animated {
             withAnimation(.easeInOut(duration: 0.15)) { proxy.scrollTo(id) }
         } else {
-            proxy.scrollTo(id, anchor: .center)
+            proxy.scrollTo(id)
         }
     }
 }
 
 private struct SectionHeader: View {
-    let section: ItemSection
+    let title: String
+    let count: Int
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "folder")
-            Text(section.title)
+            Text(title)
                 .lineLimit(1)
                 .truncationMode(.head)
-            Text("\(section.range.count)")
+            Text("\(count)")
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             Spacer()
@@ -91,6 +108,77 @@ private struct SectionHeader: View {
         .padding(.vertical, 6)
         .padding(.horizontal, 4)
         .background(.bar)
+    }
+}
+
+/// A folder shown as a tile, with the first image found inside as its picture.
+struct FolderTile: View {
+    @EnvironmentObject private var library: MediaLibrary
+    let folder: URL
+    let size: CGFloat
+
+    @State private var preview: FolderPreview?
+    @State private var image: CGImage?
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack(alignment: .bottomLeading) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.secondary.opacity(0.12))
+
+                Group {
+                    if let image {
+                        Image(decorative: image, scale: 1)
+                            .resizable()
+                            .interpolation(.medium)
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: size, height: size)
+                            .clipped()
+                    } else if preview == nil {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "folder")
+                            .font(.system(size: size * 0.3))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: size, height: size)
+
+                HStack(spacing: 4) {
+                    Image(systemName: "folder.fill")
+                    if let preview {
+                        if preview.fileCount > 0 { Text("사진 \(preview.fileCount)") }
+                        if preview.folderCount > 0 { Text("폴더 \(preview.folderCount)") }
+                    }
+                }
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+                .padding(6)
+            }
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            Text(folder.lastPathComponent)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: size)
+        }
+        .contentShape(Rectangle())
+        .help(folder.path)
+        .task(id: folder) {
+            let result = await library.preview(for: folder)
+            guard !Task.isCancelled else { return }
+            preview = result
+            if let url = result.imageURL {
+                let thumb = await ThumbnailCache.shared.thumbnail(for: url)
+                guard !Task.isCancelled else { return }
+                image = thumb
+            }
+        }
     }
 }
 

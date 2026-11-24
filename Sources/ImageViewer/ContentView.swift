@@ -28,28 +28,46 @@ struct ContentView: View {
 
     private var title: String {
         if library.viewMode == .single, let item = library.current { return item.name }
-        if library.items.isEmpty { return "이미지 뷰어" }
-        return "파일 \(library.items.count)개"
+        switch library.browseMode {
+        case .folder:
+            return library.currentFolder?.lastPathComponent ?? "이미지 뷰어"
+        case .all:
+            return "전체 모아보기"
+        }
     }
 
     @ViewBuilder
     private var detail: some View {
-        Group {
-            if library.isScanning {
-                ProgressView("폴더를 살펴보는 중…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let item = library.current {
-                VStack(spacing: 0) {
-                    switch library.viewMode {
-                    case .grid:
-                        ThumbnailGrid(thumbSize: CGFloat(thumbSize))
-                    case .single:
-                        ImageCanvas(item: item)
-                    }
-                    StatusBar(item: item)
-                }
-            } else {
+        VStack(spacing: 0) {
+            if library.viewMode == .grid, library.browseMode == .folder, !library.rootFolders.isEmpty {
+                PathBar()
+                Divider()
+            }
+
+            if library.viewMode == .single, let item = library.current {
+                ImageCanvas(item: item)
+            } else if library.rootFolders.isEmpty {
                 EmptyStateView()
+            } else if library.items.isEmpty, library.subfolders.isEmpty {
+                VStack(spacing: 8) {
+                    if library.isLoading {
+                        ProgressView()
+                        Text("폴더를 읽는 중…").foregroundStyle(.secondary)
+                    } else {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("이 폴더에는 볼 수 있는 파일이 없어요")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ThumbnailGrid(thumbSize: CGFloat(thumbSize))
+            }
+
+            if !library.rootFolders.isEmpty {
+                StatusBar()
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -59,31 +77,36 @@ struct ContentView: View {
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
             Button { library.chooseFolders() } label: {
-                Label("폴더 열기", systemImage: "folder")
+                Label("폴더 열기", systemImage: "folder.badge.plus")
             }
             .help("폴더 열기 (⌘O)")
 
-            Picker("보기 방식", selection: $library.viewMode) {
-                Label("썸네일", systemImage: "square.grid.2x2").tag(ViewMode.grid)
-                Label("한 장씩", systemImage: "photo").tag(ViewMode.single)
+            Picker("보는 방식", selection: $library.browseMode) {
+                Text("폴더별").tag(BrowseMode.folder)
+                Text("전체 모아보기").tag(BrowseMode.all)
             }
             .pickerStyle(.segmented)
-            .help("썸네일 / 한 장씩 보기 (Return, Esc)")
-            .disabled(library.current == nil)
+            .help("폴더별: 한 폴더씩 들어가며 보기 / 전체 모아보기: 하위 폴더의 사진까지 한꺼번에 보기")
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            Button { library.previous() } label: {
-                Label("이전", systemImage: "chevron.left")
-            }
-            .help("이전 파일 (←)")
-            .disabled(library.items.isEmpty)
+            Menu {
+                Picker("정렬 기준", selection: $library.sortKey) {
+                    ForEach(SortKey.allCases) { key in
+                        Text(key.title).tag(key)
+                    }
+                }
+                .pickerStyle(.inline)
 
-            Button { library.next() } label: {
-                Label("다음", systemImage: "chevron.right")
+                Picker("순서", selection: $library.sortAscending) {
+                    Text("오름차순").tag(true)
+                    Text("내림차순").tag(false)
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label("정렬", systemImage: "arrow.up.arrow.down")
             }
-            .help("다음 파일 (→)")
-            .disabled(library.items.isEmpty)
+            .help("정렬: \(library.sortKey.title), \(library.sortAscending ? "오름차순" : "내림차순")")
 
             if library.viewMode == .grid {
                 Slider(value: $thumbSize, in: 80...280) {
@@ -96,6 +119,11 @@ struct ContentView: View {
                 .frame(width: 140)
                 .help("썸네일 크기")
             } else {
+                Button { library.viewMode = .grid } label: {
+                    Label("썸네일로", systemImage: "square.grid.2x2")
+                }
+                .help("썸네일로 돌아가기 (Esc)")
+
                 Button { library.zoomOut() } label: {
                     Label("축소", systemImage: "minus.magnifyingglass")
                 }
@@ -119,24 +147,20 @@ struct ContentView: View {
         }
     }
 
-    /// Dropping folders (or files) onto the window opens them.
+    /// Dropping folders (or files) onto the window adds their folders.
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         let fileProviders = providers.filter { $0.canLoadObject(ofClass: URL.self) }
         guard !fileProviders.isEmpty else { return false }
 
         Task { @MainActor in
-            var urls: [URL] = []
+            var folders: [URL] = []
             for provider in fileProviders {
-                if let url = await loadURL(from: provider) { urls.append(url) }
-            }
-            let folders = urls.map { url -> URL in
+                guard let url = await loadURL(from: provider) else { continue }
                 var isDir: ObjCBool = false
                 FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                return isDir.boolValue ? url : url.deletingLastPathComponent()
+                folders.append(isDir.boolValue ? url : url.deletingLastPathComponent())
             }
-            var unique: [URL] = []
-            for folder in folders where !unique.contains(folder) { unique.append(folder) }
-            if !unique.isEmpty { library.load(folders: unique) }
+            if !folders.isEmpty { library.add(folders: folders) }
         }
         return true
     }
@@ -150,6 +174,32 @@ struct ContentView: View {
     }
 }
 
+/// Where you are in folder mode, with a button to go up.
+private struct PathBar: View {
+    @EnvironmentObject private var library: MediaLibrary
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { library.goUp() } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!library.canGoUp)
+            .help("상위 폴더로 (⌘↑ 또는 Delete)")
+
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+            Text(library.locationTitle)
+                .lineLimit(1)
+                .truncationMode(.head)
+            Spacer()
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+}
+
 private struct EmptyStateView: View {
     @EnvironmentObject private var library: MediaLibrary
 
@@ -158,18 +208,11 @@ private struct EmptyStateView: View {
             Image(systemName: "photo.on.rectangle.angled")
                 .font(.system(size: 56))
                 .foregroundStyle(.secondary)
-            if library.rootFolders.isEmpty {
-                Text("폴더를 열어 주세요")
-                    .font(.title2)
-                Text("하위 폴더까지 모두 불러와요. 폴더 여러 개를 한 번에 고르거나,\n창에 폴더를 끌어다 놓아도 돼요.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("볼 수 있는 파일이 없어요")
-                    .font(.title2)
-                Text("고른 폴더 안에서 png, jpg, gif, psd 같은 파일을 찾지 못했어요.")
-                    .foregroundStyle(.secondary)
-            }
+            Text("폴더를 열어 주세요")
+                .font(.title2)
+            Text("한 번 연 폴더는 기억해 두었다가 다음에도 바로 보여줘요.\n폴더 여러 개를 한 번에 고르거나, 창에 끌어다 놓아도 돼요.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
             Button("폴더 열기…") { library.chooseFolders() }
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
@@ -181,19 +224,28 @@ private struct EmptyStateView: View {
 
 private struct StatusBar: View {
     @EnvironmentObject private var library: MediaLibrary
-    let item: MediaItem
 
     var body: some View {
         HStack(spacing: 12) {
-            Text("\(library.currentIndex + 1) / \(library.items.count)")
-                .monospacedDigit()
-            Text(item.displayPath)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .foregroundStyle(.secondary)
-                .onTapGesture(count: 2) { library.revealInFinder() }
-                .help("두 번 누르면 Finder에서 보여줘요")
+            if let item = library.current {
+                Text("\(library.currentIndex + 1) / \(library.items.count)")
+                    .monospacedDigit()
+                Text(item.displayPath)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+                    .onTapGesture(count: 2) { library.revealInFinder() }
+                    .help("두 번 누르면 Finder에서 보여줘요")
+            } else {
+                Text("사진 없음").foregroundStyle(.secondary)
+            }
             Spacer()
+            if library.isLoading, library.browseMode == .all {
+                ProgressView().controlSize(.small)
+                Text("찾는 중… \(library.items.count)개")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
             if library.viewMode == .single {
                 Text(library.zoom == nil ? "맞춤 \(percent(library.fitScale))" : percent(library.effectiveZoom))
                     .monospacedDigit()

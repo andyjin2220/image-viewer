@@ -1,7 +1,8 @@
+import AppKit
 import SwiftUI
 
-/// The opened folders and their subfolders. Selecting one or more (⌘-click)
-/// shows only the files under them; selecting nothing shows everything.
+/// The opened folders. Subfolders are read only when a folder is expanded.
+/// Click shows a folder; ⌘-click selects several and gathers all of their files.
 struct SidebarView: View {
     @EnvironmentObject private var library: MediaLibrary
 
@@ -15,12 +16,10 @@ struct SidebarView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(selection: $library.selectedFolders) {
+                List {
                     Section("폴더") {
-                        OutlineGroup(library.folderTree, children: \.children) { node in
-                            FolderRow(node: node)
-                                .tag(node.url)
-                                .contextMenu { contextMenu(for: node) }
+                        ForEach(library.rootNodes) { node in
+                            FolderTreeRow(node: node)
                         }
                     }
                 }
@@ -43,8 +42,8 @@ struct SidebarView: View {
                 Spacer()
 
                 if !library.selectedFolders.isEmpty {
-                    Button("전체 보기") { library.selectedFolders = [] }
-                        .help("폴더 선택을 풀고 모든 파일을 보여줘요")
+                    Button("선택 풀기") { library.showEverything() }
+                        .help("폴더 선택을 풀어요")
                 }
             }
             .buttonStyle(.borderless)
@@ -52,36 +51,59 @@ struct SidebarView: View {
         }
         .frame(minWidth: 200)
     }
-
-    @ViewBuilder
-    private func contextMenu(for node: FolderNode) -> some View {
-        Button("이 폴더만 보기") { library.selectedFolders = [node.url] }
-        Button("Finder에서 보기") { library.revealInFinder(node.url) }
-        if node.isRoot {
-            Divider()
-            Button("목록에서 빼기 (파일은 그대로)") { library.removeRoot(node.url) }
-        }
-    }
 }
 
-private struct FolderRow: View {
-    let node: FolderNode
+private struct FolderTreeRow: View {
+    @EnvironmentObject private var library: MediaLibrary
+    @ObservedObject var node: FolderNode
+    @State private var isExpanded = false
 
     var body: some View {
-        Label {
-            HStack {
-                Text(node.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                Text("\(node.count)")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
+        Group {
+            if let children = node.children, !children.isEmpty {
+                DisclosureGroup(isExpanded: $isExpanded) {
+                    ForEach(children) { child in
+                        FolderTreeRow(node: child)
+                    }
+                } label: {
+                    label
+                }
+            } else {
+                label
             }
+        }
+        // Only this folder's own listing is read, to know whether it has subfolders.
+        .task { await node.loadChildren() }
+    }
+
+    private var label: some View {
+        let isSelected = library.selectedFolders.contains(node.url)
+        return Label {
+            Text(node.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
         } icon: {
             Image(systemName: node.isRoot ? "folder.fill" : "folder")
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            library.sidebarClick(node.url, toggle: NSEvent.modifierFlags.contains(.command))
+        }
         .help(node.url.path)
+        .contextMenu {
+            Button("이 폴더 보기") { library.enter(node.url) }
+            Button("Finder에서 보기") { library.revealInFinder(node.url) }
+            if node.isRoot {
+                Divider()
+                Button("목록에서 빼기 (파일은 그대로)") { library.removeRoot(node.url) }
+            }
+        }
     }
 }

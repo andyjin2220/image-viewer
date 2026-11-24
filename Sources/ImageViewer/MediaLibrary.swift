@@ -1,38 +1,11 @@
 import AppKit
 import Foundation
 
-struct MediaItem: Identifiable, Hashable, Sendable {
-    let url: URL
-    /// The folder the user picked that this file was found under.
-    let root: URL
-
-    var id: URL { url }
-    var name: String { url.lastPathComponent }
-    var folder: URL { url.deletingLastPathComponent() }
-
-    /// Path shown to the user, relative to the picked folder (e.g. "작업/2024/a.png").
-    var displayPath: String { MediaLibrary.displayPath(of: url, under: root) }
-}
-
-/// A folder in the sidebar. Only folders that hold supported files (directly or below) appear.
-struct FolderNode: Identifiable, Hashable, Sendable {
-    let url: URL
-    let name: String
-    /// Number of files in this folder and all of its subfolders.
-    let count: Int
-    let isRoot: Bool
-    let children: [FolderNode]?
-
-    var id: URL { url }
-}
-
-/// A run of files from one folder, shown as one section of the thumbnail grid.
+/// A run of files shown as one section of the thumbnail grid.
 struct ItemSection: Identifiable, Sendable {
-    let folder: URL
+    let id: String
     let title: String
     let range: Range<Int>
-
-    var id: URL { folder }
 }
 
 enum ViewMode {
@@ -40,28 +13,89 @@ enum ViewMode {
     case single
 }
 
-/// Holds the folders the user opened, the files found in them, which ones are
-/// shown, which one is selected, and the current zoom.
+enum BrowseMode: Hashable {
+    /// One folder at a time: its subfolders as folder tiles, then its own files. Nothing below is read.
+    case folder
+    /// Every file in the selected folders and all of their subfolders.
+    case all
+}
+
+enum SortKey: String, CaseIterable, Identifiable {
+    case name, date, size
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name: "이름"
+        case .date: "수정한 날짜"
+        case .size: "크기"
+        }
+    }
+}
+
+/// A folder in the sidebar. Its subfolders are read only when the row is shown.
+@MainActor
+final class FolderNode: ObservableObject, Identifiable {
+    let url: URL
+    let isRoot: Bool
+    /// nil until read.
+    @Published private(set) var children: [FolderNode]?
+    private var isLoading = false
+
+    var id: URL { url }
+    var name: String { url.lastPathComponent }
+
+    init(url: URL, isRoot: Bool) {
+        self.url = url
+        self.isRoot = isRoot
+    }
+
+    func loadChildren() async {
+        guard children == nil, !isLoading else { return }
+        isLoading = true
+        let url = url
+        let folders = await Task.detached(priority: .utility) { FileLister.subfolders(of: url) }.value
+        children = folders.map { FolderNode(url: $0, isRoot: false) }
+        isLoading = false
+    }
+}
+
+/// The app's state: opened folders, what is shown, the selected file, sorting and zoom.
 @MainActor
 final class MediaLibrary: ObservableObject {
-    /// Formats macOS can decode on its own (ImageIO), including PSD.
-    nonisolated static let supportedExtensions: Set<String> = [
-        "png", "jpg", "jpeg", "gif", "psd", "bmp", "tif", "tiff", "heic", "heif", "webp",
-    ]
-
     @Published private(set) var rootFolders: [URL] = []
-    @Published private(set) var folderTree: [FolderNode] = []
-    @Published private(set) var isScanning = false
+    @Published private(set) var rootNodes: [FolderNode] = []
 
-    /// Every file found in the opened folders.
-    private var allItems: [MediaItem] = []
-    /// Files currently shown: all of them, or only those under the folders selected in the sidebar.
+    @Published var browseMode: BrowseMode = .folder {
+        didSet { if browseMode != oldValue { browseModeChanged() } }
+    }
+
+    /// Folder shown in folder mode; nil shows the opened folders themselves.
+    @Published private(set) var currentFolder: URL?
+    /// Folder tiles shown in folder mode.
+    @Published private(set) var subfolders: [URL] = []
+
+    /// Files shown, sorted. The single view moves through these.
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var sections: [ItemSection] = []
+    @Published private(set) var isLoading = false
 
-    /// Folders selected in the sidebar. Empty means "show everything".
-    @Published var selectedFolders: Set<URL> = [] {
-        didSet { if selectedFolders != oldValue { applyFilter() } }
+    /// Folders highlighted in the sidebar. In "all" mode, these are the folders gathered (empty = all).
+    @Published private(set) var selectedFolders: Set<URL> = []
+
+    @Published var sortKey: SortKey = .name {
+        didSet {
+            UserDefaults.standard.set(sortKey.rawValue, forKey: Self.sortKeyKey)
+            rebuild(keepingCurrent: true)
+        }
+    }
+
+    @Published var sortAscending = true {
+        didSet {
+            UserDefaults.standard.set(sortAscending, forKey: Self.sortAscendingKey)
+            rebuild(keepingCurrent: true)
+        }
     }
 
     @Published var viewMode: ViewMode = .grid
@@ -72,20 +106,29 @@ final class MediaLibrary: ObservableObject {
 
     /// nil means "fit to window"; otherwise 1.0 is actual pixel size.
     @Published var zoom: CGFloat?
-
     /// Scale that fits the current image in the window. Kept up to date by the view.
     @Published var fitScale: CGFloat = 1
-
     /// Number of thumbnail columns, kept up to date by the grid so ↑/↓ can move by rows.
     var gridColumns: Int = 1
 
-    private var scanTask: Task<Void, Never>?
+    /// Files as read, before sorting.
+    private var rawItems: [MediaItem] = []
+    private var loadTask: Task<Void, Never>?
+    private var previewCache: [URL: FolderPreview] = [:]
 
     private static let savedFoldersKey = "savedFolders"
+    private static let sortKeyKey = "sortKey"
+    private static let sortAscendingKey = "sortAscending"
 
     init() {
-        let saved = Self.restoreSavedFolders()
-        if !saved.isEmpty { load(folders: saved) }
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.sortKeyKey), let key = SortKey(rawValue: raw) {
+            sortKey = key
+        }
+        if defaults.object(forKey: Self.sortAscendingKey) != nil {
+            sortAscending = defaults.bool(forKey: Self.sortAscendingKey)
+        }
+        setRoots(Self.restoreSavedFolders())
     }
 
     var current: MediaItem? {
@@ -94,20 +137,22 @@ final class MediaLibrary: ObservableObject {
 
     var effectiveZoom: CGFloat { zoom ?? fitScale }
 
-    // MARK: Opening folders
+    var canGoUp: Bool { browseMode == .folder && currentFolder != nil }
 
-    /// Replaces whatever is open with the folders the user picks.
+    // MARK: Opened folders
+
     func chooseFolders() {
         guard let urls = pickFolders(prompt: "열기") else { return }
-        load(folders: urls)
+        setRoots(urls)
     }
 
-    /// Keeps what is open and adds the folders the user picks.
     func addFolders() {
         guard let urls = pickFolders(prompt: "추가") else { return }
-        var roots = rootFolders
-        for url in urls where !roots.contains(url) { roots.append(url) }
-        load(folders: roots)
+        add(folders: urls)
+    }
+
+    func add(folders: [URL]) {
+        setRoots(rootFolders + folders)
     }
 
     func removeRoot(_ url: URL) {
@@ -115,23 +160,62 @@ final class MediaLibrary: ObservableObject {
     }
 
     func removeRoots(_ urls: Set<URL>) {
-        let paths = Set(urls.map { $0.standardizedFileURL.path })
-        load(folders: rootFolders.filter { !paths.contains($0.standardizedFileURL.path) })
+        let paths = Set(urls.map(\.standardizedFileURL.path))
+        setRoots(rootFolders.filter { !paths.contains($0.standardizedFileURL.path) })
     }
 
     func closeAllFolders() {
-        load(folders: [])
+        setRoots([])
     }
 
-    /// Opened folders that are selected in the sidebar (only top-level ones can be removed).
+    /// Opened folders among the sidebar selection (only those can be removed from the list).
     var selectedRoots: Set<URL> {
-        let roots = Set(rootFolders.map { $0.standardizedFileURL.path })
-        return Set(selectedFolders.filter { roots.contains($0.standardizedFileURL.path) })
+        Set(selectedFolders.filter { rootFolders.contains($0) })
     }
 
-    // MARK: Remembering opened folders
+    private func pickFolders(prompt: String) -> [URL]? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = prompt
+        panel.message = "볼 폴더를 고르세요. ⌘를 누른 채 클릭하면 여러 개를 고를 수 있어요."
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return nil }
+        return panel.urls
+    }
 
-    /// Saves the opened folders as bookmarks, so they still open after being renamed or moved.
+    private func setRoots(_ folders: [URL]) {
+        var unique: [URL] = []
+        for folder in folders.map(FileLister.normalized) where !unique.contains(folder) {
+            unique.append(folder)
+        }
+        rootFolders = unique
+        saveFolders(unique)
+
+        let existing = Dictionary(uniqueKeysWithValues: rootNodes.map { ($0.url, $0) })
+        rootNodes = unique.map { existing[$0] ?? FolderNode(url: $0, isRoot: true) }
+
+        // Forget a folder or selection that is no longer under an opened folder.
+        if let folder = currentFolder, !isUnderRoot(folder) { currentFolder = nil }
+        selectedFolders = selectedFolders.filter(isUnderRoot)
+        previewCache = [:]
+        refresh()
+    }
+
+    private func isUnderRoot(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        return rootFolders.contains { FileLister.isSameOrInside(path, $0.standardizedFileURL.path) }
+    }
+
+    /// The opened folder that contains this folder (the deepest one, if they nest).
+    private func root(for folder: URL) -> URL {
+        let path = folder.standardizedFileURL.path
+        return rootFolders
+            .filter { FileLister.isSameOrInside(path, $0.standardizedFileURL.path) }
+            .max { $0.path.count < $1.path.count } ?? folder
+    }
+
+    /// Saved as bookmarks, so they still open after being renamed or moved.
     private func saveFolders(_ folders: [URL]) {
         let bookmarks = folders.compactMap { try? $0.bookmarkData() }
         UserDefaults.standard.set(bookmarks, forKey: Self.savedFoldersKey)
@@ -148,138 +232,181 @@ final class MediaLibrary: ObservableObject {
         }
     }
 
-    private func pickFolders(prompt: String) -> [URL]? {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = true
-        panel.prompt = prompt
-        panel.message = "볼 폴더를 고르세요. ⌘를 누른 채 클릭하면 여러 개를 고를 수 있고, 하위 폴더까지 모두 불러와요."
-        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return nil }
-        return panel.urls
+    // MARK: Sidebar and folder navigation
+
+    /// A click on a sidebar folder. ⌘-click adds or removes it from the selection;
+    /// selecting more than one folder gathers all of their files.
+    func sidebarClick(_ url: URL, toggle: Bool) {
+        if toggle {
+            if selectedFolders.contains(url) { selectedFolders.remove(url) } else { selectedFolders.insert(url) }
+        } else {
+            selectedFolders = [url]
+        }
+
+        if selectedFolders.count > 1, browseMode == .folder {
+            browseMode = .all   // its didSet reloads
+        } else if browseMode == .folder {
+            currentFolder = selectedFolders.first
+            refresh()
+        } else {
+            refresh()
+        }
     }
 
-    func load(folders: [URL]) {
-        scanTask?.cancel()
-        let previousSelection = selectedFolders
-        rootFolders = folders
-        saveFolders(folders)
-        if folders.isEmpty {
-            allItems = []
-            folderTree = []
+    /// Clears the sidebar selection: the opened folders (folder mode) or everything (all mode).
+    func showEverything() {
+        selectedFolders = []
+        currentFolder = nil
+        refresh()
+    }
+
+    /// Opens a folder tile.
+    func enter(_ folder: URL) {
+        browseMode = .folder
+        currentFolder = folder
+        selectedFolders = [folder]
+        refresh()
+    }
+
+    func goUp() {
+        guard browseMode == .folder, let folder = currentFolder else { return }
+        if rootFolders.contains(folder) {
+            currentFolder = nil
             selectedFolders = []
-            applyFilter()
+        } else {
+            let parent = FileLister.normalized(folder.deletingLastPathComponent())
+            currentFolder = parent
+            selectedFolders = [parent]
         }
-        isScanning = !folders.isEmpty
-        scanTask = Task {
-            let (found, tree) = await Task.detached(priority: .userInitiated) {
-                let found = MediaLibrary.scan(folders)
-                return (found, MediaLibrary.buildTree(roots: folders, items: found))
+        refresh()
+    }
+
+    private func browseModeChanged() {
+        if browseMode == .folder {
+            if selectedFolders.count == 1 {
+                currentFolder = selectedFolders.first
+            } else {
+                selectedFolders = currentFolder.map { [$0] } ?? []
+            }
+        }
+        refresh()
+    }
+
+    func refresh() {
+        loadTask?.cancel()
+        viewMode = .grid
+        switch browseMode {
+        case .folder: loadFolder()
+        case .all: loadAll()
+        }
+    }
+
+    /// Reads just the one folder being looked at.
+    private func loadFolder() {
+        guard let folder = currentFolder else {
+            subfolders = rootFolders
+            rawItems = []
+            rebuild(keepingCurrent: false)
+            isLoading = false
+            return
+        }
+        let root = root(for: folder)
+        isLoading = true
+        loadTask = Task {
+            let (folders, files) = await Task.detached(priority: .userInitiated) {
+                FileLister.list(folder, root: root)
             }.value
             guard !Task.isCancelled else { return }
-            self.allItems = found
-            self.folderTree = tree
-            let stillThere = Set(Self.flatten(tree).map(\.url))
-            // Assigning selectedFolders re-filters only when it changes, so filter explicitly too.
-            self.selectedFolders = previousSelection.intersection(stillThere)
-            self.applyFilter()
-            self.isScanning = false
+            subfolders = folders
+            rawItems = files
+            rebuild(keepingCurrent: false)
+            isLoading = false
         }
     }
 
-    private func applyFilter() {
-        if selectedFolders.isEmpty {
-            items = allItems
+    /// Reads the selected folders and everything below them, showing files as they are found.
+    private func loadAll() {
+        subfolders = []
+        rawItems = []
+        rebuild(keepingCurrent: false)
+
+        let scope = (selectedFolders.isEmpty ? rootFolders : Array(selectedFolders))
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        let targets = scope.map { ScanTarget(folder: $0, root: root(for: $0)) }
+        isLoading = !targets.isEmpty
+        guard !targets.isEmpty else { return }
+
+        loadTask = Task {
+            var lastRebuild = Date.distantPast
+            for await batch in FileLister.scan(targets) {
+                guard !Task.isCancelled else { return }
+                rawItems += batch
+                // Re-sorting a big list costs time, so do it less often as the list grows.
+                let interval = rawItems.count < 5000 ? 0.3 : 1.5
+                if Date().timeIntervalSince(lastRebuild) >= interval {
+                    rebuild(keepingCurrent: true)
+                    lastRebuild = Date()
+                }
+            }
+            guard !Task.isCancelled else { return }
+            rebuild(keepingCurrent: true)
+            isLoading = false
+        }
+    }
+
+    /// Folder tile preview, read once per folder.
+    func preview(for folder: URL) async -> FolderPreview {
+        if let cached = previewCache[folder] { return cached }
+        let preview = await Task.detached(priority: .utility) { FileLister.preview(of: folder) }.value
+        previewCache[folder] = preview
+        return preview
+    }
+
+    // MARK: Sorting and sections
+
+    private var groupsByFolder: Bool { browseMode == .all && sortKey == .name }
+
+    private func rebuild(keepingCurrent: Bool) {
+        let keepID = keepingCurrent ? current?.id : nil
+        items = Self.sorted(rawItems, key: sortKey, ascending: sortAscending, groupByFolder: groupsByFolder)
+        sections = makeSections()
+        if let keepID, let index = items.firstIndex(where: { $0.id == keepID }) {
+            if index != currentIndex { currentIndex = index }
         } else {
-            let prefixes = selectedFolders.map { $0.standardizedFileURL.path }
-            items = allItems.filter { item in
-                let dir = item.folder.standardizedFileURL.path
-                return prefixes.contains { dir == $0 || dir.hasPrefix($0 + "/") }
-            }
+            currentIndex = 0
         }
-        sections = Self.makeSections(items)
-        currentIndex = 0
-        zoom = nil
-        viewMode = .grid
+        if items.isEmpty { viewMode = .grid }
     }
 
-    // MARK: Scanning (runs off the main thread)
-
-    /// Walks every folder and all of its subfolders and returns supported files.
-    /// Files are grouped by folder, and names are sorted the way Finder sorts them (2 before 10).
-    nonisolated static func scan(_ folders: [URL]) -> [MediaItem] {
-        let fm = FileManager.default
-        var seen = Set<String>()
-        var result: [MediaItem] = []
-
-        for folder in folders {
-            guard let enumerator = fm.enumerator(
-                at: folder,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
-            ) else { continue }
-
-            var batch: [URL] = []
-            while let url = enumerator.nextObject() as? URL {
-                guard supportedExtensions.contains(url.pathExtension.lowercased()) else { continue }
-                // Opening a folder and one of its subfolders together must not list files twice.
-                if seen.insert(url.standardizedFileURL.path).inserted {
-                    batch.append(url)
-                }
+    nonisolated static func sorted(
+        _ items: [MediaItem], key: SortKey, ascending: Bool, groupByFolder: Bool
+    ) -> [MediaItem] {
+        items.sorted { a, b in
+            if groupByFolder {
+                let order = a.folder.path.localizedStandardCompare(b.folder.path)
+                if order != .orderedSame { return order == .orderedAscending }
             }
-            batch.sort { a, b in
-                let dirOrder = a.deletingLastPathComponent().path
-                    .localizedStandardCompare(b.deletingLastPathComponent().path)
-                if dirOrder != .orderedSame { return dirOrder == .orderedAscending }
-                return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+            let order: ComparisonResult
+            switch key {
+            case .name:
+                order = a.name.localizedStandardCompare(b.name)
+            case .date:
+                order = a.modified == b.modified ? .orderedSame : (a.modified < b.modified ? .orderedAscending : .orderedDescending)
+            case .size:
+                order = a.size == b.size ? .orderedSame : (a.size < b.size ? .orderedAscending : .orderedDescending)
             }
-            result += batch.map { MediaItem(url: $0, root: folder) }
+            if order == .orderedSame {
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+            return ascending ? order == .orderedAscending : order == .orderedDescending
         }
-        return result
     }
 
-    nonisolated static func buildTree(roots: [URL], items: [MediaItem]) -> [FolderNode] {
-        var direct: [String: Int] = [:]
-        for item in items {
-            direct[item.folder.standardizedFileURL.path, default: 0] += 1
+    private func makeSections() -> [ItemSection] {
+        guard !items.isEmpty else { return [] }
+        guard groupsByFolder else {
+            return [ItemSection(id: "all", title: browseMode == .folder ? "사진" : "전체", range: 0..<items.count)]
         }
-
-        var childrenOf: [String: Set<String>] = [:]
-        for root in roots {
-            let rootPath = root.standardizedFileURL.path
-            for dir in direct.keys where dir.hasPrefix(rootPath + "/") {
-                var cur = dir
-                while cur != rootPath, cur.count > rootPath.count {
-                    let parent = (cur as NSString).deletingLastPathComponent
-                    childrenOf[parent, default: []].insert(cur)
-                    cur = parent
-                }
-            }
-        }
-
-        func make(_ path: String, isRoot: Bool) -> FolderNode {
-            let kids = (childrenOf[path] ?? [])
-                .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-                .map { make($0, isRoot: false) }
-            let total = direct[path, default: 0] + kids.reduce(0) { $0 + $1.count }
-            let url = URL(fileURLWithPath: path, isDirectory: true)
-            return FolderNode(
-                url: url,
-                name: url.lastPathComponent,
-                count: total,
-                isRoot: isRoot,
-                children: kids.isEmpty ? nil : kids
-            )
-        }
-
-        return roots.map { make($0.standardizedFileURL.path, isRoot: true) }
-    }
-
-    nonisolated static func flatten(_ nodes: [FolderNode]) -> [FolderNode] {
-        nodes.flatMap { [$0] + flatten($0.children ?? []) }
-    }
-
-    nonisolated static func makeSections(_ items: [MediaItem]) -> [ItemSection] {
         var sections: [ItemSection] = []
         var start = 0
         while start < items.count {
@@ -287,8 +414,8 @@ final class MediaLibrary: ObservableObject {
             var end = start + 1
             while end < items.count, items[end].folder == folder { end += 1 }
             sections.append(ItemSection(
-                folder: folder,
-                title: displayPath(of: folder, under: items[start].root),
+                id: folder.path,
+                title: FileLister.displayPath(of: folder, under: items[start].root),
                 range: start..<end
             ))
             start = end
@@ -296,12 +423,10 @@ final class MediaLibrary: ObservableObject {
         return sections
     }
 
-    nonisolated static func displayPath(of url: URL, under root: URL) -> String {
-        let rootPath = root.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        guard path.hasPrefix(rootPath) else { return url.lastPathComponent }
-        let relative = path.dropFirst(rootPath.count).drop(while: { $0 == "/" })
-        return relative.isEmpty ? root.lastPathComponent : root.lastPathComponent + "/" + relative
+    /// Where the grid is, for the path bar in folder mode.
+    var locationTitle: String {
+        guard let folder = currentFolder else { return "열린 폴더" }
+        return FileLister.displayPath(of: folder, under: root(for: folder))
     }
 
     // MARK: Navigation
@@ -313,7 +438,7 @@ final class MediaLibrary: ObservableObject {
 
     func open(_ index: Int) {
         select(index)
-        viewMode = .single
+        if current != nil { viewMode = .single }
     }
 
     func next() {
@@ -365,12 +490,17 @@ final class MediaLibrary: ObservableObject {
     // MARK: Keyboard
 
     /// Keys without a menu shortcut. Returns true when the key was used.
+    /// Arrow keys always move between files, even while the sidebar has focus.
     func handleKey(_ event: NSEvent) -> Bool {
         let mods = event.modifierFlags.intersection([.command, .option, .control])
+
+        // ⌘↑ goes to the parent folder.
+        if mods == .command, event.keyCode == 126, viewMode == .grid, canGoUp {
+            goUp()
+            return true
+        }
         guard mods.isEmpty else { return false }
 
-        // Arrow keys always move between files, even while the sidebar has focus;
-        // folders are picked with the mouse.
         let inGrid = viewMode == .grid
         switch event.keyCode {
         case 124: next()                                        // right arrow
@@ -384,6 +514,8 @@ final class MediaLibrary: ObservableObject {
         case 119: last()                                        // end
         case 36, 76:                                            // return, enter
             toggleViewMode()
+        case 51:                                                // delete (backspace)
+            if inGrid, canGoUp { goUp() } else { return false }
         case 53:                                                // escape
             if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
                 window.toggleFullScreen(nil)
@@ -393,12 +525,17 @@ final class MediaLibrary: ObservableObject {
                 return false
             }
         default:
-            switch event.charactersIgnoringModifiers?.lowercased() {
-            case "f": toggleFullScreen()
-            case "+", "=": if inGrid { return false } else { zoomIn() }
-            case "-": if inGrid { return false } else { zoomOut() }
-            case "0": if inGrid { return false } else { zoomToFit() }
-            case "1": if inGrid { return false } else { zoomActualSize() }
+            let key = event.charactersIgnoringModifiers?.lowercased()
+            if key == "f" {
+                toggleFullScreen()
+                return true
+            }
+            guard !inGrid else { return false }
+            switch key {
+            case "+", "=": zoomIn()
+            case "-": zoomOut()
+            case "0": zoomToFit()
+            case "1": zoomActualSize()
             default: return false
             }
         }
