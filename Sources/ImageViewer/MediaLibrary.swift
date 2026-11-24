@@ -24,7 +24,7 @@ struct MediaItem: Identifiable, Hashable, Sendable {
 @MainActor
 final class MediaLibrary: ObservableObject {
     /// Formats macOS can decode on its own (ImageIO), including PSD.
-    static let supportedExtensions: Set<String> = [
+    nonisolated static let supportedExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "psd", "bmp", "tif", "tiff", "heic", "heif", "webp",
     ]
 
