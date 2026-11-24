@@ -43,7 +43,7 @@ final class FolderNode: ObservableObject, Identifiable {
     @Published private(set) var children: [FolderNode]?
     private var isLoading = false
 
-    var id: URL { url }
+    nonisolated var id: URL { url }
     var name: String { url.lastPathComponent }
 
     init(url: URL, isRoot: Bool) {
