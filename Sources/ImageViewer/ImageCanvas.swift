@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 
 /// Shows one image: fitted to the window by default, zoomable and scrollable.
@@ -58,32 +59,68 @@ struct ImageCanvas: View {
     }
 
     private func load(_ url: URL) async {
-        let data = await Task.detached(priority: .userInitiated) {
-            try? Data(contentsOf: url, options: .mappedIfSafe)
+        let decoded = await Task.detached(priority: .userInitiated) {
+            ImageCanvas.decode(url)
         }.value
         guard !Task.isCancelled else { return }
-        guard let data, let image = NSImage(data: data) else {
+        guard let decoded else {
             failedURL = url
             return
         }
         failedURL = nil
-        loaded = LoadedImage(url: url, image: image, pixelSize: Self.pixelSize(of: image))
+        loaded = LoadedImage(url: url, image: decoded.image, pixelSize: decoded.pixelSize)
+    }
+
+    /// Decodes the whole image off the main thread so big files (PSD, large JPEGs) don't freeze the window.
+    /// GIFs stay as NSImage data so NSImageView can animate them.
+    nonisolated static func decode(_ url: URL) -> DecodedImage? {
+        if url.pathExtension.lowercased() == "gif" {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let image = NSImage(data: data) else { return nil }
+            return DecodedImage(image: image, pixelSize: pixelSize(of: image))
+        }
+
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else {
+            // Fall back to AppKit for anything ImageIO can't describe.
+            guard let image = NSImage(contentsOf: url) else { return nil }
+            return DecodedImage(image: image, pixelSize: pixelSize(of: image))
+        }
+
+        // A "thumbnail" as large as the image itself gives a fully decoded, correctly rotated picture.
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(width, height),
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let size = CGSize(width: cgImage.width, height: cgImage.height)
+        return DecodedImage(image: NSImage(cgImage: cgImage, size: size), pixelSize: size)
     }
 
     /// Fits the image inside the window without enlarging small images.
-    static func fitScale(for imageSize: CGSize, in area: CGSize) -> CGFloat {
+    nonisolated static func fitScale(for imageSize: CGSize, in area: CGSize) -> CGFloat {
         guard imageSize.width > 0, imageSize.height > 0, area.width > 0, area.height > 0 else { return 1 }
         return min(area.width / imageSize.width, area.height / imageSize.height, 1)
     }
 
     /// Real pixel dimensions. NSImage.size can be smaller or larger when the file has a DPI set.
-    static func pixelSize(of image: NSImage) -> CGSize {
+    nonisolated static func pixelSize(of image: NSImage) -> CGSize {
         let widest = image.representations.max { $0.pixelsWide < $1.pixelsWide }
         if let rep = widest, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
             return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
         }
         return image.size
     }
+}
+
+/// A decoded image handed from a background task to the view.
+struct DecodedImage: @unchecked Sendable {
+    let image: NSImage
+    let pixelSize: CGSize
 }
 
 struct LoadedImage {
