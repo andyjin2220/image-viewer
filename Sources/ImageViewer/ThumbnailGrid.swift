@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Folder tiles (in folder mode) and thumbnails of the shown files.
@@ -22,10 +23,16 @@ struct ThumbnailGrid: View {
                         if library.browseMode == .folder, !library.subfolders.isEmpty {
                             Section {
                                 ForEach(library.subfolders, id: \.self) { folder in
-                                    FolderTile(folder: folder, size: thumbSize)
+                                    FolderTile(folder: folder, size: thumbSize, isPicked: library.isPicked(folder))
                                         .onTapGesture(count: 2) { library.enter(folder) }
+                                        .simultaneousGesture(TapGesture().onEnded {
+                                            if NSEvent.modifierFlags.contains(.command) { library.togglePick(folder: folder) }
+                                        })
                                         .contextMenu {
                                             Button("열기") { library.enter(folder) }
+                                            Button(library.isPicked(folder) ? "선택에서 빼기" : "선택에 넣기 (⌘ 클릭)") {
+                                                library.togglePick(folder: folder)
+                                            }
                                             Button("Finder에서 보기") { library.revealInFinder(folder) }
                                         }
                                 }
@@ -65,12 +72,30 @@ struct ThumbnailGrid: View {
     private func cell(at index: Int) -> some View {
         if library.items.indices.contains(index) {
             let item = library.items[index]
-            ThumbnailCell(item: item, size: thumbSize, isSelected: index == library.currentIndex)
+            ThumbnailCell(
+                item: item,
+                size: thumbSize,
+                isSelected: index == library.currentIndex,
+                isPicked: library.isPicked(item.url)
+            )
                 .id(item.id)
                 .onTapGesture(count: 2) { library.open(index) }
-                .simultaneousGesture(TapGesture().onEnded { library.select(index) })
+                .simultaneousGesture(TapGesture().onEnded {
+                    if NSEvent.modifierFlags.contains(.command) {
+                        library.togglePick(item)
+                    } else {
+                        library.select(index)
+                    }
+                })
+                .onAppear {
+                    // Show the next page when the last rows come into view.
+                    if index >= library.displayLimit - library.gridColumns * 3 { library.showMore() }
+                }
                 .contextMenu {
                     Button("열기") { library.open(index) }
+                    Button(library.isPicked(item.url) ? "선택에서 빼기" : "선택에 넣기 (⌘ 클릭)") {
+                        library.togglePick(item)
+                    }
                     Button("Finder에서 보기") { library.revealInFinder(item.url) }
                 }
         }
@@ -116,6 +141,7 @@ struct FolderTile: View {
     @EnvironmentObject private var library: MediaLibrary
     let folder: URL
     let size: CGFloat
+    let isPicked: Bool
 
     @State private var preview: FolderPreview?
     @State private var image: CGImage?
@@ -160,6 +186,7 @@ struct FolderTile: View {
             }
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(PickMark(isPicked: isPicked))
 
             Text(folder.lastPathComponent)
                 .font(.caption.weight(.medium))
@@ -186,6 +213,7 @@ struct ThumbnailCell: View {
     let item: MediaItem
     let size: CGFloat
     let isSelected: Bool
+    let isPicked: Bool
 
     @State private var image: CGImage?
     @State private var failed = false
@@ -231,6 +259,7 @@ struct ThumbnailCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(isSelected ? Color.accentColor : .clear, lineWidth: 3)
             )
+            .overlay(PickMark(isPicked: isPicked))
 
             Text(item.name)
                 .font(.caption)
@@ -247,6 +276,28 @@ struct ThumbnailCell: View {
             guard !Task.isCancelled else { return }
             image = result
             failed = result == nil
+        }
+    }
+}
+
+/// Check mark and tint on a ⌘-clicked tile.
+private struct PickMark: View {
+    let isPicked: Bool
+
+    var body: some View {
+        if isPicked {
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.accentColor.opacity(0.18))
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor, lineWidth: 3)
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title2)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.white, Color.accentColor)
+                    .padding(6)
+            }
+            .allowsHitTesting(false)
         }
     }
 }

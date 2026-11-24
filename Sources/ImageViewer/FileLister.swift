@@ -15,6 +15,11 @@ struct MediaItem: Identifiable, Hashable, Sendable {
     var displayPath: String { FileLister.displayPath(of: url, under: root) }
 }
 
+struct FolderEntry: Hashable, Sendable {
+    let url: URL
+    let modified: Date
+}
+
 struct ScanTarget: Sendable {
     let folder: URL
     let root: URL
@@ -69,24 +74,26 @@ enum FileLister {
     }
 
     /// Lists one folder only (no subfolders are opened): its subfolders and its supported files.
-    static func list(_ folder: URL, root: URL) -> (folders: [URL], files: [MediaItem]) {
+    static func list(_ folder: URL, root: URL) -> (folders: [FolderEntry], files: [MediaItem]) {
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: folder,
             includingPropertiesForKeys: resourceKeys,
             options: [.skipsHiddenFiles]
         ) else { return ([], []) }
 
-        var folders: [URL] = []
+        var folders: [FolderEntry] = []
         var files: [MediaItem] = []
         for url in urls {
             let values = try? url.resourceValues(forKeys: Set(resourceKeys))
             if values?.isDirectory == true {
-                if values?.isPackage != true { folders.append(normalized(url)) }
+                if values?.isPackage != true {
+                    folders.append(FolderEntry(url: normalized(url), modified: values?.contentModificationDate ?? .distantPast))
+                }
             } else if isSupported(url) {
                 files.append(makeItem(url, root: root, values: values))
             }
         }
-        folders.sort { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        folders.sort { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }
         return (folders, files)
     }
 
@@ -110,24 +117,28 @@ enum FileLister {
     static func preview(of folder: URL) -> FolderPreview {
         let (folders, files) = list(folder, root: folder)
         var imageURL = files.min { $0.name.localizedStandardCompare($1.name) == .orderedAscending }?.url
-        var queue = folders
+        var queue = folders.map(\.url)
         var visited = 0
         while imageURL == nil, !queue.isEmpty, visited < 30 {
             let next = queue.removeFirst()
             visited += 1
             let (subfolders, subfiles) = list(next, root: next)
             imageURL = subfiles.min { $0.name.localizedStandardCompare($1.name) == .orderedAscending }?.url
-            queue += subfolders
+            queue += subfolders.map(\.url)
         }
         return FolderPreview(imageURL: imageURL, fileCount: files.count, folderCount: folders.count)
     }
 
     /// Walks the folders and all their subfolders, handing back files in batches as they are found,
     /// so the first ones can be shown right away. Stops when the consumer stops listening.
-    static func scan(_ targets: [ScanTarget]) -> AsyncStream<[MediaItem]> {
+    static func modifiedDate(of url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+    }
+
+    static func scan(_ targets: [ScanTarget], skipping skipPaths: Set<String> = []) -> AsyncStream<[MediaItem]> {
         AsyncStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
-                var seen = Set<String>()
+                var seen = skipPaths
                 var batch: [MediaItem] = []
                 var lastYield = Date()
                 let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
@@ -145,7 +156,7 @@ enum FileLister {
                         // A folder and one of its subfolders opened together must not list files twice.
                         guard seen.insert(url.standardizedFileURL.path).inserted else { continue }
                         batch.append(makeItem(url, root: target.root, values: try? url.resourceValues(forKeys: keys)))
-                        if Date().timeIntervalSince(lastYield) > 0.25 {
+                        if Date().timeIntervalSince(lastYield) > 0.5 {
                             continuation.yield(batch)
                             batch = []
                             lastYield = Date()

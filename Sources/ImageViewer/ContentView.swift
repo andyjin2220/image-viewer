@@ -33,6 +33,8 @@ struct ContentView: View {
             return library.currentFolder?.lastPathComponent ?? "이미지 뷰어"
         case .all:
             return "전체 모아보기"
+        case .picked:
+            return "선택 모아보기"
         }
     }
 
@@ -41,6 +43,10 @@ struct ContentView: View {
         VStack(spacing: 0) {
             if library.viewMode == .grid, library.browseMode == .folder, !library.rootFolders.isEmpty {
                 PathBar()
+                Divider()
+            }
+            if library.viewMode == .grid, library.hasPicks {
+                PickBar()
                 Divider()
             }
 
@@ -84,6 +90,9 @@ struct ContentView: View {
             Picker("보는 방식", selection: $library.browseMode) {
                 Text("폴더별").tag(BrowseMode.folder)
                 Text("전체 모아보기").tag(BrowseMode.all)
+                if library.hasPicks || library.browseMode == .picked {
+                    Text("선택 모아보기").tag(BrowseMode.picked)
+                }
             }
             .pickerStyle(.segmented)
             .help("폴더별: 한 폴더씩 들어가며 보기 / 전체 모아보기: 하위 폴더의 사진까지 한꺼번에 보기")
@@ -91,22 +100,43 @@ struct ContentView: View {
 
         ToolbarItemGroup(placement: .primaryAction) {
             Menu {
-                Picker("정렬 기준", selection: $library.sortKey) {
-                    ForEach(SortKey.allCases) { key in
-                        Text(key.title).tag(key)
+                Section("폴더 정렬") {
+                    Picker("폴더 정렬 기준", selection: $library.sort.folderKey) {
+                        ForEach(FolderSortKey.allCases) { key in
+                            Text(key.title).tag(key)
+                        }
                     }
-                }
-                .pickerStyle(.inline)
+                    .pickerStyle(.inline)
+                    .labelsHidden()
 
-                Picker("순서", selection: $library.sortAscending) {
-                    Text("오름차순").tag(true)
-                    Text("내림차순").tag(false)
+                    Picker("폴더 순서", selection: $library.sort.folderAscending) {
+                        Text("오름차순").tag(true)
+                        Text("내림차순").tag(false)
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
                 }
-                .pickerStyle(.inline)
+
+                Section("폴더 안 사진 정렬") {
+                    Picker("사진 정렬 기준", selection: $library.sort.fileKey) {
+                        ForEach(SortKey.allCases) { key in
+                            Text(key.title).tag(key)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+
+                    Picker("사진 순서", selection: $library.sort.fileAscending) {
+                        Text("오름차순").tag(true)
+                        Text("내림차순").tag(false)
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+                }
             } label: {
                 Label("정렬", systemImage: "arrow.up.arrow.down")
             }
-            .help("정렬: \(library.sortKey.title), \(library.sortAscending ? "오름차순" : "내림차순")")
+            .help(sortHelp)
 
             if library.viewMode == .grid {
                 Slider(value: $thumbSize, in: 80...280) {
@@ -145,6 +175,13 @@ struct ContentView: View {
             }
             .help("전체화면 (F)")
         }
+    }
+
+    private var sortHelp: String {
+        let s = library.sort
+        let folderOrder = s.folderAscending ? "오름차순" : "내림차순"
+        let fileOrder = s.fileAscending ? "오름차순" : "내림차순"
+        return "폴더: \(s.folderKey.title) \(folderOrder) / 사진: \(s.fileKey.title) \(fileOrder)"
     }
 
     /// Dropping folders (or files) onto the window adds their folders.
@@ -200,6 +237,39 @@ private struct PathBar: View {
     }
 }
 
+/// What is ⌘-clicked, with buttons to view it all together or clear it.
+private struct PickBar: View {
+    @EnvironmentObject private var library: MediaLibrary
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(Color.accentColor)
+            Text(summary)
+            Spacer()
+            if library.browseMode != .picked {
+                Button("선택 모아보기") { library.openPicked() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("고른 사진과 고른 폴더 안의 모든 사진을 모아서 봐요")
+            }
+            Button("선택 해제") { library.clearPicks() }
+                .controlSize(.small)
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    private var summary: String {
+        var parts: [String] = []
+        if !library.pickedFolders.isEmpty { parts.append("폴더 \(library.pickedFolders.count)개") }
+        if !library.pickedFiles.isEmpty { parts.append("사진 \(library.pickedFiles.count)개") }
+        return parts.joined(separator: ", ") + " 선택됨  ·  ⌘ 클릭으로 더 고를 수 있어요"
+    }
+}
+
 private struct EmptyStateView: View {
     @EnvironmentObject private var library: MediaLibrary
 
@@ -240,7 +310,7 @@ private struct StatusBar: View {
                 Text("사진 없음").foregroundStyle(.secondary)
             }
             Spacer()
-            if library.isLoading, library.browseMode == .all {
+            if library.isLoading, library.browseMode != .folder {
                 ProgressView().controlSize(.small)
                 Text("찾는 중… \(library.items.count)개")
                     .monospacedDigit()
