@@ -24,7 +24,6 @@ struct FileFilter: Sendable, Equatable {
         }
         let query = trimmedText
         if !query.isEmpty, !item.name.localizedCaseInsensitiveContains(query) { return false }
-        if isSlideshowRunning { restartSlideshowTimer() }
         return true
     }
 }
@@ -935,6 +934,7 @@ final class MediaLibrary: ObservableObject {
         default:
             return false
         }
+        if isSlideshowRunning { restartSlideshowTimer() }
         return true
     }
 }
