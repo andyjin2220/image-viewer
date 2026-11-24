@@ -5,15 +5,33 @@ struct ContentView: View {
     @EnvironmentObject private var library: MediaLibrary
     @State private var keyMonitor: Any?
     @AppStorage("thumbnailSize") private var thumbSize: Double = 160
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var visibilityBeforeImmersive: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
         } detail: {
             detail
+                .searchable(text: $library.filterText, placement: .toolbar, prompt: "파일 이름으로 찾기")
                 .toolbar { toolbarContent }
+                .toolbar(library.immersive ? .hidden : .visible, for: .windowToolbar)
         }
         .navigationTitle(title)
+        .onChange(of: library.immersive) { _, immersive in
+            if immersive {
+                visibilityBeforeImmersive = columnVisibility
+                columnVisibility = .detailOnly
+            } else {
+                columnVisibility = visibilityBeforeImmersive
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            library.fullScreenChanged(true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            library.fullScreenChanged(false)
+        }
         .onDrop(of: [.fileURL], isTargeted: nil, perform: handleDrop)
         .onAppear {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -45,6 +63,10 @@ struct ContentView: View {
                 PathBar()
                 Divider()
             }
+            if library.viewMode == .grid, library.isFiltering {
+                FilterBar()
+                Divider()
+            }
             if library.viewMode == .grid, library.hasPicks {
                 PickBar()
                 Divider()
@@ -67,7 +89,7 @@ struct ContentView: View {
                         Image(systemName: "photo.on.rectangle.angled")
                             .font(.system(size: 40))
                             .foregroundStyle(.secondary)
-                        Text("이 폴더에는 볼 수 있는 파일이 없어요")
+                        Text(library.isFiltering ? "필터에 맞는 파일이 없어요" : "이 폴더에는 볼 수 있는 파일이 없어요")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -76,11 +98,21 @@ struct ContentView: View {
                 ThumbnailGrid(thumbSize: CGFloat(thumbSize))
             }
 
-            if !library.rootFolders.isEmpty {
+            if !library.rootFolders.isEmpty, !library.immersive {
                 StatusBar()
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(library.immersive ? Color.black : Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) {
+            if library.immersive, library.viewMode == .single {
+                ImmersiveHUD()
+            }
+        }
+        .onContinuousHover { phase in
+            if library.immersive, case .active = phase {
+                NotificationCenter.default.post(name: .immersiveMouseMoved, object: nil)
+            }
+        }
     }
 
     @ToolbarContentBuilder
@@ -103,6 +135,26 @@ struct ContentView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            Menu {
+                ForEach(FileFilter.choices, id: \.ext) { choice in
+                    Toggle(choice.ext.uppercased(), isOn: Binding(
+                        get: { library.filterExtensions.contains(choice.ext) },
+                        set: { _ in library.toggleFilterExtension(choice.ext) }
+                    ))
+                }
+                Divider()
+                Button("모든 형식 보기") { library.filterExtensions = [] }
+                    .disabled(library.filterExtensions.isEmpty)
+            } label: {
+                Label(
+                    "형식 필터",
+                    systemImage: library.filterExtensions.isEmpty
+                        ? "line.3.horizontal.decrease.circle"
+                        : "line.3.horizontal.decrease.circle.fill"
+                )
+            }
+            .help("확장자로 거르기 (여러 개 고를 수 있어요)")
+
             Menu {
                 Section("폴더 정렬") {
                     Picker("폴더 정렬 기준", selection: $library.sort.folderKey) {
@@ -158,6 +210,11 @@ struct ContentView: View {
                 }
                 .help("썸네일로 돌아가기 (Esc)")
 
+                Button { library.toggleImmersive() } label: {
+                    Label("이미지만 보기", systemImage: "rectangle.dashed")
+                }
+                .help("이미지만 크게 보기 (H 또는 Tab, 나가기는 Esc)")
+
                 Button { library.zoomOut() } label: {
                     Label("축소", systemImage: "minus.magnifyingglass")
                 }
@@ -173,6 +230,21 @@ struct ContentView: View {
                 }
                 .help("확대 (+)")
             }
+
+            Menu {
+                ForEach(MediaLibrary.slideshowIntervals, id: \.self) { seconds in
+                    Toggle("\(Int(seconds))초마다", isOn: Binding(
+                        get: { library.slideshowInterval == seconds },
+                        set: { _ in library.slideshowInterval = seconds }
+                    ))
+                }
+            } label: {
+                Label("슬라이드쇼", systemImage: library.isSlideshowRunning ? "pause.circle" : "play.circle")
+            } primaryAction: {
+                library.toggleSlideshow()
+            }
+            .help("슬라이드쇼 (S): 누르면 시작/멈춤, 화살표로 넘기는 간격 선택 (지금 \(Int(library.slideshowInterval))초)")
+            .disabled(library.current == nil)
 
             Button { library.toggleFullScreen() } label: {
                 Label("전체화면", systemImage: "arrow.up.left.and.arrow.down.right")
@@ -215,6 +287,67 @@ struct ContentView: View {
     }
 }
 
+/// In image-only mode: file name and position, shown when the mouse moves and hidden after 2 seconds,
+/// together with the mouse pointer.
+private struct ImmersiveHUD: View {
+    @EnvironmentObject private var library: MediaLibrary
+    @State private var isVisible = true
+    @State private var hideTask: Task<Void, Never>?
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .allowsHitTesting(false)
+            .overlay(alignment: .bottom) {
+                if isVisible, let item = library.current {
+                    HStack(spacing: 12) {
+                        Text("\(library.currentIndex + 1) / \(library.items.count)")
+                            .monospacedDigit()
+                        Text(item.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if library.isSlideshowRunning {
+                            Label("\(Int(library.slideshowInterval))초마다", systemImage: "play.fill")
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                        Text(library.isSlideshowRunning ? "S 멈춤 · Esc 나가기" : "Esc 나가기")
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.6), in: Capsule())
+                    .padding(.bottom, 24)
+                    .transition(.opacity)
+                }
+            }
+            .onAppear { scheduleHide() }
+            .onDisappear { hideTask?.cancel() }
+            .onChange(of: library.currentIndex) { show() }
+            .onReceive(NotificationCenter.default.publisher(for: .immersiveMouseMoved)) { _ in show() }
+    }
+
+    private func show() {
+        withAnimation(.easeOut(duration: 0.15)) { isVisible = true }
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
+        hideTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.4)) { isVisible = false }
+            NSCursor.setHiddenUntilMouseMoves(true)
+        }
+    }
+}
+
+extension Notification.Name {
+    static let immersiveMouseMoved = Notification.Name("immersiveMouseMoved")
+}
+
 /// Where you are in folder mode, with a button to go up.
 private struct PathBar: View {
     @EnvironmentObject private var library: MediaLibrary
@@ -238,6 +371,45 @@ private struct PathBar: View {
         .font(.callout)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+}
+
+/// Shows the active filter, with buttons to gather matches from subfolders or clear it.
+private struct FilterBar: View {
+    @EnvironmentObject private var library: MediaLibrary
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .foregroundStyle(Color.accentColor)
+            Text(summary)
+                .lineLimit(1)
+            Spacer()
+            if library.browseMode == .folder {
+                Button("하위 폴더까지 모아보기") { library.gatherFilteredFromHere() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("이 폴더와 모든 하위 폴더에서 필터에 맞는 파일만 모아서 봐요")
+            }
+            Button("필터 지우기") { library.clearFilter() }
+                .controlSize(.small)
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    private var summary: String {
+        var parts: [String] = []
+        let text = library.filter.trimmedText
+        if !text.isEmpty { parts.append("이름에 \"\(text)\"") }
+        if !library.filterExtensions.isEmpty {
+            let exts = FileFilter.choices.map(\.ext).filter(library.filterExtensions.contains)
+            parts.append(exts.map { $0.uppercased() }.joined(separator: ", "))
+        }
+        let found = library.isLoading ? "찾는 중" : "\(library.items.count)개"
+        return "필터: " + parts.joined(separator: " · ") + "  →  " + found
     }
 }
 

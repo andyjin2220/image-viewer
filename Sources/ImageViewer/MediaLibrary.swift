@@ -1,6 +1,33 @@
 import AppKit
 import Foundation
 
+/// Name and extension filter. A plain value so it can be used off the main thread.
+struct FileFilter: Sendable, Equatable {
+    var text: String
+    var extensions: Set<String>
+
+    /// Extensions offered in the filter menu, with the spellings each one covers.
+    static let choices: [(ext: String, covers: Set<String>)] = [
+        ("png", ["png"]), ("jpg", ["jpg", "jpeg"]), ("gif", ["gif"]), ("psd", ["psd"]),
+        ("clip", ["clip"]), ("mp4", ["mp4", "m4v"]), ("mov", ["mov"]), ("webp", ["webp"]),
+        ("heic", ["heic", "heif"]), ("tif", ["tif", "tiff"]), ("bmp", ["bmp"]),
+    ]
+
+    var trimmedText: String { text.trimmingCharacters(in: .whitespaces) }
+    var isActive: Bool { !trimmedText.isEmpty || !extensions.isEmpty }
+
+    func matches(_ item: MediaItem) -> Bool {
+        if !extensions.isEmpty {
+            let ext = item.url.pathExtension.lowercased()
+            let allowed = Self.choices.contains { extensions.contains($0.ext) && $0.covers.contains(ext) }
+            if !allowed { return false }
+        }
+        let query = trimmedText
+        if !query.isEmpty, !item.name.localizedCaseInsensitiveContains(query) { return false }
+        return true
+    }
+}
+
 /// A run of files shown as one section of the thumbnail grid.
 struct ItemSection: Identifiable, Sendable {
     let id: String
@@ -127,12 +154,53 @@ final class MediaLibrary: ObservableObject {
         }
     }
 
-    @Published var viewMode: ViewMode = .grid
+    /// Shows only files whose name contains this text (any case).
+    @Published var filterText = "" {
+        didSet { if filterText != oldValue { rebuild(keepingCurrent: true) } }
+    }
+
+    /// Shows only these extensions (empty = all). "jpg" also covers "jpeg", "tif" covers "tiff", "heic" covers "heif".
+    @Published var filterExtensions: Set<String> = [] {
+        didSet { if filterExtensions != oldValue { rebuild(keepingCurrent: true) } }
+    }
+
+    var filter: FileFilter { FileFilter(text: filterText, extensions: filterExtensions) }
+    var isFiltering: Bool { filter.isActive }
+
+    func toggleFilterExtension(_ ext: String) {
+        if filterExtensions.contains(ext) { filterExtensions.remove(ext) } else { filterExtensions.insert(ext) }
+    }
+
+    func clearFilter() {
+        filterText = ""
+        filterExtensions = []
+    }
+
+    /// In folder mode, gathers the filtered files from this folder and all of its subfolders.
+    func gatherFilteredFromHere() {
+        if let folder = currentFolder { selectedFolders = [folder] } else { selectedFolders = [] }
+        browseMode = .all
+    }
+
+    @Published var viewMode: ViewMode = .grid {
+        didSet {
+            if viewMode == .grid {
+                immersive = false
+                stopSlideshow()
+            }
+            saveLocation()
+        }
+    }
+
+    /// "Image only": hides the sidebar, toolbar and bars so the picture fills the window.
+    /// Turned on automatically in full screen.
+    @Published var immersive = false
 
     @Published var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue { zoom = nil }
             ensureDisplayed(currentIndex)
+            saveLocation()
         }
     }
 
@@ -156,7 +224,17 @@ final class MediaLibrary: ObservableObject {
 
     init() {
         sort = Self.loadSort()
+        let interval = UserDefaults.standard.double(forKey: Self.slideshowIntervalKey)
+        slideshowInterval = interval > 0 ? interval : 3
+        // Assigned directly here so no property observer reloads before the folders are set.
+        if let saved = Self.loadLocation() {
+            browseMode = saved.mode
+            currentFolder = saved.folder
+            selectedFolders = saved.selected
+            pendingRestore = saved.file
+        }
         setRoots(Self.restoreSavedFolders())
+        didInitialRefresh = true
     }
 
     var current: MediaItem? {
@@ -348,6 +426,8 @@ final class MediaLibrary: ObservableObject {
     }
 
     func refresh() {
+        // A change the user makes replaces the place saved from last time.
+        if didInitialRefresh { pendingRestore = nil }
         loadTask?.cancel()
         arrangeGeneration += 1
         viewMode = .grid
@@ -396,7 +476,7 @@ final class MediaLibrary: ObservableObject {
     /// While reading, new files are added at the end; they are sorted once, in the background, when reading ends.
     private func gather(folders: [URL], files: [MediaItem]) {
         rawItems = files
-        items = files
+        items = filter.isActive ? files.filter(filter.matches) : files
         currentIndex = 0
         updateSections()
 
@@ -415,7 +495,7 @@ final class MediaLibrary: ObservableObject {
             for await batch in FileLister.scan(targets, skipping: skip) {
                 guard !Task.isCancelled else { return }
                 rawItems += batch
-                items += batch
+                items += filter.isActive ? batch.filter(filter.matches) : batch
                 updateSections()
                 openSingleIfRequested()
             }
@@ -480,9 +560,10 @@ final class MediaLibrary: ObservableObject {
         let input = rawItems
         let settings = sort
         let group = groupsByFolder
+        let filter = self.filter
         Task {
             let sorted = await Task.detached(priority: .userInitiated) {
-                MediaLibrary.arrange(input, settings, groupByFolder: group)
+                MediaLibrary.arrange(filter.isActive ? input.filter(filter.matches) : input, settings, groupByFolder: group)
             }.value
             guard generation == arrangeGeneration else { return }
             items = sorted
@@ -493,7 +574,9 @@ final class MediaLibrary: ObservableObject {
             }
             updateSections()
             openSingleIfRequested()
+            applyPendingRestore()
             if items.isEmpty { viewMode = .grid }
+            saveLocation()
         }
     }
 
@@ -642,6 +725,100 @@ final class MediaLibrary: ObservableObject {
         viewMode = viewMode == .grid ? .single : .grid
     }
 
+    // MARK: Slideshow
+
+    /// Seconds between pictures.
+    @Published var slideshowInterval: Double {
+        didSet {
+            UserDefaults.standard.set(slideshowInterval, forKey: Self.slideshowIntervalKey)
+            if isSlideshowRunning { restartSlideshowTimer() }
+        }
+    }
+    @Published private(set) var isSlideshowRunning = false
+    private var slideshowTask: Task<Void, Never>?
+    private static let slideshowIntervalKey = "slideshowInterval"
+    static let slideshowIntervals: [Double] = [1, 2, 3, 5, 10, 20]
+
+    /// Plays from the selected file, picture only, moving on every few seconds. Loops at the end.
+    func startSlideshow() {
+        guard current != nil else { return }
+        viewMode = .single
+        immersive = true
+        isSlideshowRunning = true
+        restartSlideshowTimer()
+    }
+
+    func stopSlideshow() {
+        slideshowTask?.cancel()
+        slideshowTask = nil
+        isSlideshowRunning = false
+    }
+
+    func toggleSlideshow() {
+        if isSlideshowRunning { stopSlideshow() } else { startSlideshow() }
+    }
+
+    /// Restarts the countdown, e.g. after you move by hand, so each picture gets its full time.
+    private func restartSlideshowTimer() {
+        slideshowTask?.cancel()
+        let interval = slideshowInterval
+        slideshowTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval))
+                guard !Task.isCancelled, let self, self.isSlideshowRunning else { return }
+                self.advanceSlideshow()
+            }
+        }
+    }
+
+    private func advanceSlideshow() {
+        guard !items.isEmpty else { return stopSlideshow() }
+        currentIndex = (currentIndex + 1) % items.count
+    }
+
+    // MARK: Remembering where you were
+
+    private static let locationKey = "lastLocation"
+    private var didInitialRefresh = false
+    /// The file to reopen once its folder has been read.
+    private var pendingRestore: (url: URL, single: Bool)?
+
+    /// Saves the mode, folder and file being looked at, so the next launch opens there.
+    private func saveLocation() {
+        guard didInitialRefresh, pendingRestore == nil else { return }
+        var values: [String: Any] = [
+            "mode": browseMode == .all ? "all" : "folder",
+            "selected": selectedFolders.map(\.path),
+            "single": viewMode == .single,
+        ]
+        if browseMode == .picked {
+            values["mode"] = "folder"
+        }
+        if let folder = currentFolder { values["folder"] = folder.path }
+        if let file = current?.url { values["file"] = file.path }
+        UserDefaults.standard.set(values, forKey: Self.locationKey)
+    }
+
+    private static func loadLocation() -> (
+        mode: BrowseMode, folder: URL?, selected: Set<URL>, file: (url: URL, single: Bool)?
+    )? {
+        guard let values = UserDefaults.standard.dictionary(forKey: locationKey) else { return nil }
+        let mode: BrowseMode = values["mode"] as? String == "all" ? .all : .folder
+        let folder = (values["folder"] as? String).map { FileLister.normalized(URL(fileURLWithPath: $0)) }
+        let selected = Set(((values["selected"] as? [String]) ?? []).map { FileLister.normalized(URL(fileURLWithPath: $0)) })
+        let file = (values["file"] as? String).map { (url: URL(fileURLWithPath: $0), single: values["single"] as? Bool ?? false) }
+        return (mode, folder, selected, file)
+    }
+
+    private func applyPendingRestore() {
+        guard let restore = pendingRestore else { return }
+        let path = restore.url.standardizedFileURL.path
+        pendingRestore = nil
+        guard let index = items.firstIndex(where: { $0.url.standardizedFileURL.path == path }) else { return }
+        currentIndex = index
+        if restore.single { viewMode = .single }
+    }
+
     // MARK: Zoom
 
     static let minZoom: CGFloat = 0.05
@@ -656,8 +833,37 @@ final class MediaLibrary: ObservableObject {
     func zoomToFit() { zoom = nil }
     func zoomActualSize() { zoom = 1 }
 
+    private var window: NSWindow? { NSApp.keyWindow ?? NSApp.mainWindow }
+
+    var isFullScreen: Bool { window?.styleMask.contains(.fullScreen) ?? false }
+
+    /// Full screen shows only the picture. Opens the selected file first when in the grid.
     func toggleFullScreen() {
-        (NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+        if !isFullScreen, viewMode == .grid, current != nil { viewMode = .single }
+        window?.toggleFullScreen(nil)
+    }
+
+    /// Image only, inside the window.
+    func toggleImmersive() {
+        if immersive {
+            immersive = false
+        } else {
+            guard current != nil else { return }
+            viewMode = .single
+            immersive = true
+        }
+    }
+
+    /// Called when the window enters or leaves full screen (by key, menu or the green button).
+    func fullScreenChanged(_ isFullScreen: Bool) {
+        if isFullScreen {
+            if current != nil {
+                viewMode = .single
+                immersive = true
+            }
+        } else {
+            immersive = false
+        }
     }
 
     func revealInFinder(_ url: URL? = nil) {
@@ -679,6 +885,9 @@ final class MediaLibrary: ObservableObject {
         }
         guard mods.isEmpty else { return false }
 
+        // Let the search field have every key while you type in it.
+        if NSApp.keyWindow?.firstResponder is NSText { return false }
+
         let inGrid = viewMode == .grid
         switch event.keyCode {
         case 124: next()                                        // right arrow
@@ -699,29 +908,33 @@ final class MediaLibrary: ObservableObject {
             toggleViewMode()
         case 51:                                                // delete (backspace)
             if inGrid, canGoUp { goUp() } else { return false }
+        case 48:                                                // tab
+            toggleImmersive()
         case 53:                                                // escape
-            if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
-                window.toggleFullScreen(nil)
+            if isSlideshowRunning {
+                stopSlideshow()
+            } else if isFullScreen {
+                window?.toggleFullScreen(nil)
+            } else if immersive {
+                immersive = false
             } else if viewMode == .single {
                 viewMode = .grid
             } else {
                 return false
             }
+        // Letter and number keys are matched by their position on the keyboard, not by the
+        // character typed, so they also work while the Korean input source is on (ㄹ = F, ㅗ = H).
+        case 1: toggleSlideshow()                               // S
+        case 3: toggleFullScreen()                              // F
+        case 4: toggleImmersive()                               // H
+        case 24, 69: if inGrid { return false } else { zoomIn() }       // = / +, keypad +
+        case 27, 78: if inGrid { return false } else { zoomOut() }      // -, keypad -
+        case 29, 82: if inGrid { return false } else { zoomToFit() }    // 0, keypad 0
+        case 18, 83: if inGrid { return false } else { zoomActualSize() } // 1, keypad 1
         default:
-            let key = event.charactersIgnoringModifiers?.lowercased()
-            if key == "f" {
-                toggleFullScreen()
-                return true
-            }
-            guard !inGrid else { return false }
-            switch key {
-            case "+", "=": zoomIn()
-            case "-": zoomOut()
-            case "0": zoomToFit()
-            case "1": zoomActualSize()
-            default: return false
-            }
+            return false
         }
+        if isSlideshowRunning { restartSlideshowTimer() }
         return true
     }
 }
