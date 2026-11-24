@@ -13,6 +13,7 @@ struct ContentView: View {
             SidebarView()
         } detail: {
             detail
+                .searchable(text: $library.filterText, placement: .toolbar, prompt: "파일 이름으로 찾기")
                 .toolbar { toolbarContent }
                 .toolbar(library.immersive ? .hidden : .visible, for: .windowToolbar)
         }
@@ -62,6 +63,10 @@ struct ContentView: View {
                 PathBar()
                 Divider()
             }
+            if library.viewMode == .grid, library.isFiltering {
+                FilterBar()
+                Divider()
+            }
             if library.viewMode == .grid, library.hasPicks {
                 PickBar()
                 Divider()
@@ -84,7 +89,7 @@ struct ContentView: View {
                         Image(systemName: "photo.on.rectangle.angled")
                             .font(.system(size: 40))
                             .foregroundStyle(.secondary)
-                        Text("이 폴더에는 볼 수 있는 파일이 없어요")
+                        Text(library.isFiltering ? "필터에 맞는 파일이 없어요" : "이 폴더에는 볼 수 있는 파일이 없어요")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -130,6 +135,26 @@ struct ContentView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            Menu {
+                ForEach(FileFilter.choices, id: \.ext) { choice in
+                    Toggle(choice.ext.uppercased(), isOn: Binding(
+                        get: { library.filterExtensions.contains(choice.ext) },
+                        set: { _ in library.toggleFilterExtension(choice.ext) }
+                    ))
+                }
+                Divider()
+                Button("모든 형식 보기") { library.filterExtensions = [] }
+                    .disabled(library.filterExtensions.isEmpty)
+            } label: {
+                Label(
+                    "형식 필터",
+                    systemImage: library.filterExtensions.isEmpty
+                        ? "line.3.horizontal.decrease.circle"
+                        : "line.3.horizontal.decrease.circle.fill"
+                )
+            }
+            .help("확장자로 거르기 (여러 개 고를 수 있어요)")
+
             Menu {
                 Section("폴더 정렬") {
                     Picker("폴더 정렬 기준", selection: $library.sort.folderKey) {
@@ -327,6 +352,45 @@ private struct PathBar: View {
         .font(.callout)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+}
+
+/// Shows the active filter, with buttons to gather matches from subfolders or clear it.
+private struct FilterBar: View {
+    @EnvironmentObject private var library: MediaLibrary
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .foregroundStyle(Color.accentColor)
+            Text(summary)
+                .lineLimit(1)
+            Spacer()
+            if library.browseMode == .folder {
+                Button("하위 폴더까지 모아보기") { library.gatherFilteredFromHere() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("이 폴더와 모든 하위 폴더에서 필터에 맞는 파일만 모아서 봐요")
+            }
+            Button("필터 지우기") { library.clearFilter() }
+                .controlSize(.small)
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    private var summary: String {
+        var parts: [String] = []
+        let text = library.filter.trimmedText
+        if !text.isEmpty { parts.append("이름에 \"\(text)\"") }
+        if !library.filterExtensions.isEmpty {
+            let exts = FileFilter.choices.map(\.ext).filter(library.filterExtensions.contains)
+            parts.append(exts.map { $0.uppercased() }.joined(separator: ", "))
+        }
+        let found = library.isLoading ? "찾는 중" : "\(library.items.count)개"
+        return "필터: " + parts.joined(separator: " · ") + "  →  " + found
     }
 }
 

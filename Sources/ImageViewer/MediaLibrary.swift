@@ -1,6 +1,33 @@
 import AppKit
 import Foundation
 
+/// Name and extension filter. A plain value so it can be used off the main thread.
+struct FileFilter: Sendable, Equatable {
+    var text: String
+    var extensions: Set<String>
+
+    /// Extensions offered in the filter menu, with the spellings each one covers.
+    static let choices: [(ext: String, covers: Set<String>)] = [
+        ("png", ["png"]), ("jpg", ["jpg", "jpeg"]), ("gif", ["gif"]), ("psd", ["psd"]),
+        ("clip", ["clip"]), ("mp4", ["mp4", "m4v"]), ("mov", ["mov"]), ("webp", ["webp"]),
+        ("heic", ["heic", "heif"]), ("tif", ["tif", "tiff"]), ("bmp", ["bmp"]),
+    ]
+
+    var trimmedText: String { text.trimmingCharacters(in: .whitespaces) }
+    var isActive: Bool { !trimmedText.isEmpty || !extensions.isEmpty }
+
+    func matches(_ item: MediaItem) -> Bool {
+        if !extensions.isEmpty {
+            let ext = item.url.pathExtension.lowercased()
+            let allowed = Self.choices.contains { extensions.contains($0.ext) && $0.covers.contains(ext) }
+            if !allowed { return false }
+        }
+        let query = trimmedText
+        if !query.isEmpty, !item.name.localizedCaseInsensitiveContains(query) { return false }
+        return true
+    }
+}
+
 /// A run of files shown as one section of the thumbnail grid.
 struct ItemSection: Identifiable, Sendable {
     let id: String
@@ -125,6 +152,34 @@ final class MediaLibrary: ObservableObject {
             subfolders = Self.sortedFolders(rawSubfolders, sort)
             rebuild(keepingCurrent: true)
         }
+    }
+
+    /// Shows only files whose name contains this text (any case).
+    @Published var filterText = "" {
+        didSet { if filterText != oldValue { rebuild(keepingCurrent: true) } }
+    }
+
+    /// Shows only these extensions (empty = all). "jpg" also covers "jpeg", "tif" covers "tiff", "heic" covers "heif".
+    @Published var filterExtensions: Set<String> = [] {
+        didSet { if filterExtensions != oldValue { rebuild(keepingCurrent: true) } }
+    }
+
+    var filter: FileFilter { FileFilter(text: filterText, extensions: filterExtensions) }
+    var isFiltering: Bool { filter.isActive }
+
+    func toggleFilterExtension(_ ext: String) {
+        if filterExtensions.contains(ext) { filterExtensions.remove(ext) } else { filterExtensions.insert(ext) }
+    }
+
+    func clearFilter() {
+        filterText = ""
+        filterExtensions = []
+    }
+
+    /// In folder mode, gathers the filtered files from this folder and all of its subfolders.
+    func gatherFilteredFromHere() {
+        if let folder = currentFolder { selectedFolders = [folder] } else { selectedFolders = [] }
+        browseMode = .all
     }
 
     @Published var viewMode: ViewMode = .grid {
@@ -402,7 +457,7 @@ final class MediaLibrary: ObservableObject {
     /// While reading, new files are added at the end; they are sorted once, in the background, when reading ends.
     private func gather(folders: [URL], files: [MediaItem]) {
         rawItems = files
-        items = files
+        items = filter.isActive ? files.filter(filter.matches) : files
         currentIndex = 0
         updateSections()
 
@@ -421,7 +476,7 @@ final class MediaLibrary: ObservableObject {
             for await batch in FileLister.scan(targets, skipping: skip) {
                 guard !Task.isCancelled else { return }
                 rawItems += batch
-                items += batch
+                items += filter.isActive ? batch.filter(filter.matches) : batch
                 updateSections()
                 openSingleIfRequested()
             }
@@ -486,9 +541,10 @@ final class MediaLibrary: ObservableObject {
         let input = rawItems
         let settings = sort
         let group = groupsByFolder
+        let filter = self.filter
         Task {
             let sorted = await Task.detached(priority: .userInitiated) {
-                MediaLibrary.arrange(input, settings, groupByFolder: group)
+                MediaLibrary.arrange(filter.isActive ? input.filter(filter.matches) : input, settings, groupByFolder: group)
             }.value
             guard generation == arrangeGeneration else { return }
             items = sorted
@@ -714,6 +770,9 @@ final class MediaLibrary: ObservableObject {
         }
         guard mods.isEmpty else { return false }
 
+        // Let the search field have every key while you type in it.
+        if NSApp.keyWindow?.firstResponder is NSText { return false }
+
         let inGrid = viewMode == .grid
         switch event.keyCode {
         case 124: next()                                        // right arrow
@@ -746,24 +805,16 @@ final class MediaLibrary: ObservableObject {
             } else {
                 return false
             }
+        // Letter and number keys are matched by their position on the keyboard, not by the
+        // character typed, so they also work while the Korean input source is on (ㄹ = F, ㅗ = H).
+        case 3: toggleFullScreen()                              // F
+        case 4: toggleImmersive()                               // H
+        case 24, 69: if inGrid { return false } else { zoomIn() }       // = / +, keypad +
+        case 27, 78: if inGrid { return false } else { zoomOut() }      // -, keypad -
+        case 29, 82: if inGrid { return false } else { zoomToFit() }    // 0, keypad 0
+        case 18, 83: if inGrid { return false } else { zoomActualSize() } // 1, keypad 1
         default:
-            let key = event.charactersIgnoringModifiers?.lowercased()
-            if key == "f" {
-                toggleFullScreen()
-                return true
-            }
-            if key == "h" {
-                toggleImmersive()
-                return true
-            }
-            guard !inGrid else { return false }
-            switch key {
-            case "+", "=": zoomIn()
-            case "-": zoomOut()
-            case "0": zoomToFit()
-            case "1": zoomActualSize()
-            default: return false
-            }
+            return false
         }
         return true
     }
