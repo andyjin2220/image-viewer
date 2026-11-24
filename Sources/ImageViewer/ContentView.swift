@@ -5,15 +5,32 @@ struct ContentView: View {
     @EnvironmentObject private var library: MediaLibrary
     @State private var keyMonitor: Any?
     @AppStorage("thumbnailSize") private var thumbSize: Double = 160
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var visibilityBeforeImmersive: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
         } detail: {
             detail
                 .toolbar { toolbarContent }
+                .toolbar(library.immersive ? .hidden : .visible, for: .windowToolbar)
         }
         .navigationTitle(title)
+        .onChange(of: library.immersive) { _, immersive in
+            if immersive {
+                visibilityBeforeImmersive = columnVisibility
+                columnVisibility = .detailOnly
+            } else {
+                columnVisibility = visibilityBeforeImmersive
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            library.fullScreenChanged(true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            library.fullScreenChanged(false)
+        }
         .onDrop(of: [.fileURL], isTargeted: nil, perform: handleDrop)
         .onAppear {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -76,11 +93,21 @@ struct ContentView: View {
                 ThumbnailGrid(thumbSize: CGFloat(thumbSize))
             }
 
-            if !library.rootFolders.isEmpty {
+            if !library.rootFolders.isEmpty, !library.immersive {
                 StatusBar()
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(library.immersive ? Color.black : Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) {
+            if library.immersive, library.viewMode == .single {
+                ImmersiveHUD()
+            }
+        }
+        .onContinuousHover { phase in
+            if library.immersive, case .active = phase {
+                NotificationCenter.default.post(name: .immersiveMouseMoved, object: nil)
+            }
+        }
     }
 
     @ToolbarContentBuilder
@@ -158,6 +185,11 @@ struct ContentView: View {
                 }
                 .help("썸네일로 돌아가기 (Esc)")
 
+                Button { library.toggleImmersive() } label: {
+                    Label("이미지만 보기", systemImage: "rectangle.dashed")
+                }
+                .help("이미지만 크게 보기 (H 또는 Tab, 나가기는 Esc)")
+
                 Button { library.zoomOut() } label: {
                     Label("축소", systemImage: "minus.magnifyingglass")
                 }
@@ -213,6 +245,63 @@ struct ContentView: View {
             }
         }
     }
+}
+
+/// In image-only mode: file name and position, shown when the mouse moves and hidden after 2 seconds,
+/// together with the mouse pointer.
+private struct ImmersiveHUD: View {
+    @EnvironmentObject private var library: MediaLibrary
+    @State private var isVisible = true
+    @State private var hideTask: Task<Void, Never>?
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .allowsHitTesting(false)
+            .overlay(alignment: .bottom) {
+                if isVisible, let item = library.current {
+                    HStack(spacing: 12) {
+                        Text("\(library.currentIndex + 1) / \(library.items.count)")
+                            .monospacedDigit()
+                        Text(item.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("Esc 나가기")
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.6), in: Capsule())
+                    .padding(.bottom, 24)
+                    .transition(.opacity)
+                }
+            }
+            .onAppear { scheduleHide() }
+            .onDisappear { hideTask?.cancel() }
+            .onChange(of: library.currentIndex) { show() }
+            .onReceive(NotificationCenter.default.publisher(for: .immersiveMouseMoved)) { _ in show() }
+    }
+
+    private func show() {
+        withAnimation(.easeOut(duration: 0.15)) { isVisible = true }
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
+        hideTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.4)) { isVisible = false }
+            NSCursor.setHiddenUntilMouseMoves(true)
+        }
+    }
+}
+
+extension Notification.Name {
+    static let immersiveMouseMoved = Notification.Name("immersiveMouseMoved")
 }
 
 /// Where you are in folder mode, with a button to go up.

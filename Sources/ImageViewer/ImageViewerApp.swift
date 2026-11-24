@@ -25,6 +25,8 @@ struct ImageViewerApp: App {
             CommandMenu("보기") {
                 Button("썸네일 / 한 장씩 보기 전환") { library.toggleViewMode() }
                     .keyboardShortcut("g")
+                Button("이미지만 보기 (H)") { library.toggleImmersive() }
+                Button("전체화면 (F)") { library.toggleFullScreen() }
                 Divider()
                 // ← → and the other plain keys are handled in MediaLibrary.handleKey
                 // so the sidebar's folder list can still use them when it has focus.

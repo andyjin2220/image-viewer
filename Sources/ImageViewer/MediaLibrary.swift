@@ -127,7 +127,13 @@ final class MediaLibrary: ObservableObject {
         }
     }
 
-    @Published var viewMode: ViewMode = .grid
+    @Published var viewMode: ViewMode = .grid {
+        didSet { if viewMode == .grid { immersive = false } }
+    }
+
+    /// "Image only": hides the sidebar, toolbar and bars so the picture fills the window.
+    /// Turned on automatically in full screen.
+    @Published var immersive = false
 
     @Published var currentIndex: Int = 0 {
         didSet {
@@ -656,8 +662,37 @@ final class MediaLibrary: ObservableObject {
     func zoomToFit() { zoom = nil }
     func zoomActualSize() { zoom = 1 }
 
+    private var window: NSWindow? { NSApp.keyWindow ?? NSApp.mainWindow }
+
+    var isFullScreen: Bool { window?.styleMask.contains(.fullScreen) ?? false }
+
+    /// Full screen shows only the picture. Opens the selected file first when in the grid.
     func toggleFullScreen() {
-        (NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+        if !isFullScreen, viewMode == .grid, current != nil { viewMode = .single }
+        window?.toggleFullScreen(nil)
+    }
+
+    /// Image only, inside the window.
+    func toggleImmersive() {
+        if immersive {
+            immersive = false
+        } else {
+            guard current != nil else { return }
+            viewMode = .single
+            immersive = true
+        }
+    }
+
+    /// Called when the window enters or leaves full screen (by key, menu or the green button).
+    func fullScreenChanged(_ isFullScreen: Bool) {
+        if isFullScreen {
+            if current != nil {
+                viewMode = .single
+                immersive = true
+            }
+        } else {
+            immersive = false
+        }
     }
 
     func revealInFinder(_ url: URL? = nil) {
@@ -699,9 +734,13 @@ final class MediaLibrary: ObservableObject {
             toggleViewMode()
         case 51:                                                // delete (backspace)
             if inGrid, canGoUp { goUp() } else { return false }
+        case 48:                                                // tab
+            toggleImmersive()
         case 53:                                                // escape
-            if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
-                window.toggleFullScreen(nil)
+            if isFullScreen {
+                window?.toggleFullScreen(nil)
+            } else if immersive {
+                immersive = false
             } else if viewMode == .single {
                 viewMode = .grid
             } else {
@@ -711,6 +750,10 @@ final class MediaLibrary: ObservableObject {
             let key = event.charactersIgnoringModifiers?.lowercased()
             if key == "f" {
                 toggleFullScreen()
+                return true
+            }
+            if key == "h" {
+                toggleImmersive()
                 return true
             }
             guard !inGrid else { return false }
