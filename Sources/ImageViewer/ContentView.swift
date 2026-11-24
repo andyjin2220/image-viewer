@@ -231,6 +231,21 @@ struct ContentView: View {
                 .help("확대 (+)")
             }
 
+            Menu {
+                ForEach(MediaLibrary.slideshowIntervals, id: \.self) { seconds in
+                    Toggle("\(Int(seconds))초마다", isOn: Binding(
+                        get: { library.slideshowInterval == seconds },
+                        set: { _ in library.slideshowInterval = seconds }
+                    ))
+                }
+            } label: {
+                Label("슬라이드쇼", systemImage: library.isSlideshowRunning ? "pause.circle" : "play.circle")
+            } primaryAction: {
+                library.toggleSlideshow()
+            }
+            .help("슬라이드쇼 (S): 누르면 시작/멈춤, 화살표로 넘기는 간격 선택 (지금 \(Int(library.slideshowInterval))초)")
+            .disabled(library.current == nil)
+
             Button { library.toggleFullScreen() } label: {
                 Label("전체화면", systemImage: "arrow.up.left.and.arrow.down.right")
             }
@@ -291,7 +306,11 @@ private struct ImmersiveHUD: View {
                         Text(item.name)
                             .lineLimit(1)
                             .truncationMode(.middle)
-                        Text("Esc 나가기")
+                        if library.isSlideshowRunning {
+                            Label("\(Int(library.slideshowInterval))초마다", systemImage: "play.fill")
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                        Text(library.isSlideshowRunning ? "S 멈춤 · Esc 나가기" : "Esc 나가기")
                             .foregroundStyle(.white.opacity(0.6))
                     }
                     .font(.callout)
