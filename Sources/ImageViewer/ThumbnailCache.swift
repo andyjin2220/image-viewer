@@ -1,3 +1,4 @@
+import AVFoundation
 import CryptoKit
 import Foundation
 import ImageIO
@@ -42,7 +43,7 @@ final class ThumbnailCache: @unchecked Sendable {
         }
         if Task.isCancelled { return nil }
 
-        guard let image = Self.makeThumbnail(of: url) else { return nil }
+        guard let image = await Self.makeThumbnail(of: url) else { return nil }
         remember(image, key: key)
         Self.write(image, to: diskURL)
         return image
@@ -62,9 +63,35 @@ final class ThumbnailCache: @unchecked Sendable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    static func makeThumbnail(of url: URL) -> CGImage? {
-        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+    static func makeThumbnail(of url: URL) async -> CGImage? {
+        switch MediaKind(url: url) {
+        case .video:
+            return await videoFrame(of: url)
+        case .clip:
+            guard let png = ClipFile.previewPNG(of: url),
+                  let source = CGImageSourceCreateWithData(png as CFData, nil) else { return nil }
+            return thumbnail(from: source)
+        case .image:
+            let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+            return thumbnail(from: source)
+        }
+    }
+
+    /// A frame one second in (or the first frame for very short clips).
+    private static func videoFrame(of url: URL) async -> CGImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+        for seconds in [1.0, 0.0] {
+            if let frame = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)) {
+                return frame.image
+            }
+        }
+        return nil
+    }
+
+    private static func thumbnail(from source: CGImageSource) -> CGImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,

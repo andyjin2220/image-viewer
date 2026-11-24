@@ -51,7 +51,11 @@ struct ContentView: View {
             }
 
             if library.viewMode == .single, let item = library.current {
-                ImageCanvas(item: item)
+                if item.kind == .video {
+                    VideoCanvas(item: item)
+                } else {
+                    ImageCanvas(item: item)
+                }
             } else if library.rootFolders.isEmpty {
                 EmptyStateView()
             } else if library.items.isEmpty, library.subfolders.isEmpty {
@@ -316,7 +320,7 @@ private struct StatusBar: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
-            if library.viewMode == .single {
+            if library.viewMode == .single, library.current?.kind != .video {
                 Text(library.zoom == nil ? "맞춤 \(percent(library.fitScale))" : percent(library.effectiveZoom))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)

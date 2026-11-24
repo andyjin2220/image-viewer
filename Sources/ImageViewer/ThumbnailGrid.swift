@@ -243,6 +243,15 @@ struct ThumbnailCell: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+                if item.kind == .video, image != nil {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: max(size * 0.2, 18)))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.5))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .allowsHitTesting(false)
+                }
+
                 let ext = item.url.pathExtension.lowercased()
                 if !Self.plainExtensions.contains(ext) {
                     Text(ext.uppercased())

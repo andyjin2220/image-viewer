@@ -685,7 +685,12 @@ final class MediaLibrary: ObservableObject {
         case 123: previous()                                    // left arrow
         case 125: inGrid ? moveBy(gridColumns) : next()         // down arrow
         case 126: inGrid ? moveBy(-gridColumns) : previous()    // up arrow
-        case 49: next()                                         // space
+        case 49:                                                // space
+            if viewMode == .single, current?.kind == .video {
+                NotificationCenter.default.post(name: .toggleVideoPlayback, object: nil)
+            } else {
+                next()
+            }
         case 121: next()                                        // page down
         case 116: previous()                                    // page up
         case 115: first()                                       // home
